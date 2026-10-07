@@ -1,0 +1,6 @@
+Этот вариант **не содержит LUFS meter** — индикаторы `BASS INPUT/OUTPUT` являются peak dB, а `DUCKING` показывает максимальное/текущее снижение в процентах.
+Если следующая версия должна быть уже максимально близкой к коммерческому **Kickstart 2**, я бы следующим шагом добавил **настоящий
+LUFS/RMS meter, beat-synced ducking, lookahead, smooth attack/release, oversampling и более точную envelope-кривую**, не ломая этот отдельный AUX и waveform history.
+
+
+довести UI до коммерческого уровня: красивый custom knob rendering, A/B, Bypass, preset browser, BPM/beat synchronization и нормальный MIX blend bar
