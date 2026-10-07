@@ -20,7 +20,7 @@ namespace
     juce::Font font(float size, bool bold = false)
     {
         return juce::Font(juce::FontOptions{}.withHeight(size)
-                              .withStyle(bold ? juce::Font::bold : juce::Font::plain));
+                              .withStyle(bold ? "Bold" : "Regular"));
     }
 
     float dbNorm(float db)
@@ -41,8 +41,7 @@ namespace
         {
             char number[32]{};
             std::snprintf(number, sizeof(number), "%.*f", decimals, value);
-            for (const char* p = number; *p != 0; ++p)
-                out.appendChar(static_cast<juce_wchar>(*p));
+            out.append(juce::String(number), 64);
         }
         out.append(suffix, 64);
     }
