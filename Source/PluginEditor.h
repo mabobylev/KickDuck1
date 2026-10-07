@@ -23,11 +23,7 @@ private:
         CurveEditor();
 
         void setPoints(const std::vector<DuckingCurve::Point>&);
-        void setWaveforms(const float* bassIn,
-                          const float* bassOut,
-                          const float* kick);
-        void setWaveformsFromProcessor(KickDuck1AudioProcessor&,
-                                        int samplesToCopy);
+        void setWaveformsFromProcessor(KickDuck1AudioProcessor&, int samplesToCopy);
         void setAmount(float normalizedAmount);
         void setPhase(float normalizedPhase);
 
@@ -40,145 +36,70 @@ private:
         void mouseDoubleClick(const juce::MouseEvent&) override;
 
     private:
-        static constexpr int maxWaveformPoints = 2048;
+        static constexpr int maxWaveformPoints = 1600;
         static constexpr int maxCurvePoints = 32;
 
         juce::Rectangle<float> graphBounds() const;
-
         float xToNorm(float x) const;
-        float yToNorm(float y) const;
-
-        juce::Point<float> normToPoint(float x, float y) const;
-
+        float screenYToVisualNorm(float y) const;
+        juce::Point<float> pointToScreen(const DuckingCurve::Point&) const;
         int findPoint(juce::Point<float>) const;
-
         void notifyPointsChanged();
-
-        void drawWaveform(
-            juce::Graphics&,
-            const std::array<float, maxWaveformPoints>&,
-            juce::Rectangle<float>,
-            juce::Colour,
-            float) const;
-
-        void drawDuckCurve(juce::Graphics&) const;
-
-        float curveVisualValue(float y) const noexcept;
+        void normalizeWaveform(std::array<float, maxWaveformPoints>&);
+        void drawWaveform(juce::Graphics&, const std::array<float, maxWaveformPoints>&,
+                          juce::Rectangle<float>, juce::Colour, float) const;
+        void drawCurve(juce::Graphics&) const;
 
         std::vector<DuckingCurve::Point> points;
-
-        std::array<float, maxWaveformPoints> bassInWaveform{};
+        std::array<float, maxWaveformPoints> bassInWaveform{}; // compatibility only; never drawn
         std::array<float, maxWaveformPoints> bassOutWaveform{};
         std::array<float, maxWaveformPoints> kickWaveform{};
 
         float amount = 0.75f;
         float phase = 0.0f;
-
         int selectedPoint = -1;
         bool dragging = false;
     };
 
     void timerCallback() override;
-
     void updateWaveform();
     void updateMeters();
-
-    void setupKnob(
-        juce::Slider&,
-        juce::Label&,
-        const juce::String&);
-
-    static juce::Font makeFont(
-        float size,
-        bool bold = false);
-
-    static void setLabelStyle(
-        juce::Label&,
-        float size,
-        juce::Colour);
-
+    void setupKnob(juce::Slider&, juce::Label&, const juce::String&);
+    static juce::Font font(float size, bool bold = false);
     static juce::String formatDb(float);
     static juce::String formatMs(float);
     static juce::String formatPercent(float);
     static juce::String formatLength(float);
 
-    void drawMeterCard(
-        juce::Graphics&,
-        juce::Rectangle<float>,
-        const juce::String&,
-        float levelDb,
-        const juce::String&,
-        bool gainReduction) const;
-
-    void drawSmallReadout(
-        juce::Graphics&,
-        juce::Rectangle<float>,
-        const juce::String&,
-        const juce::String&,
-        const juce::String&,
-        juce::Colour) const;
-
-    void drawControlCard(
-        juce::Graphics&,
-        juce::Rectangle<float>,
-        const juce::String&,
-        const juce::String&,
-        juce::Colour) const;
+    void drawMeter(juce::Graphics&, juce::Rectangle<float>, float levelDb,
+                   const juce::String& title, const juce::String& value,
+                   bool gainReduction) const;
+    void drawReadout(juce::Graphics&, juce::Rectangle<float>, const juce::String& title,
+                     const juce::String& main, const juce::String& sub,
+                     juce::Colour accent) const;
 
     KickDuck1AudioProcessor& processor;
-
     CurveEditor curveEditor;
 
-    juce::Slider amountSlider;
-    juce::Slider lengthSlider;
-    juce::Slider attackSlider;
-    juce::Slider releaseSlider;
-    juce::Slider mixSlider;
+    juce::Slider amountSlider, lengthSlider, attackSlider, releaseSlider, mixSlider;
+    juce::Slider inputSlider, outputSlider;
+    juce::Label amountLabel, lengthLabel, attackLabel, releaseLabel, mixLabel;
+    juce::Label inputLabel, outputLabel;
 
-    juce::Label amountLabel;
-    juce::Label lengthLabel;
-    juce::Label attackLabel;
-    juce::Label releaseLabel;
-    juce::Label mixLabel;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> amountAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> lengthAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attackAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> releaseAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> mixAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> inputAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> outputAttachment;
 
-    std::unique_ptr<
-        juce::AudioProcessorValueTreeState::SliderAttachment>
-        amountAttachment;
+    juce::String inputPeakText, inputRmsText, inputLufsText;
+    juce::String outputPeakText, outputRmsText, outputLufsText;
+    juce::String kickPeakText, kickRmsText;
+    juce::String grDbText, grPercentText, duckText, sidechainText;
 
-    std::unique_ptr<
-        juce::AudioProcessorValueTreeState::SliderAttachment>
-        lengthAttachment;
+    int waveformFrameCounter = 0;
 
-    std::unique_ptr<
-        juce::AudioProcessorValueTreeState::SliderAttachment>
-        attackAttachment;
-
-    std::unique_ptr<
-        juce::AudioProcessorValueTreeState::SliderAttachment>
-        releaseAttachment;
-
-    std::unique_ptr<
-        juce::AudioProcessorValueTreeState::SliderAttachment>
-        mixAttachment;
-
-    juce::String inputPeakText;
-    juce::String outputPeakText;
-
-    juce::String inputRmsText;
-    juce::String outputRmsText;
-
-    juce::String inputLufsText;
-    juce::String outputLufsText;
-
-    juce::String kickPeakText;
-    juce::String kickRmsText;
-
-    juce::String grDbText;
-    juce::String grPercentText;
-
-    juce::String duckText;
-    juce::String sidechainText;
-
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(
-        KickDuck1AudioProcessorEditor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(KickDuck1AudioProcessorEditor)
 };
