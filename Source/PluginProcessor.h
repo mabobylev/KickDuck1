@@ -49,6 +49,7 @@ public:
     float getGainReductionDb() const noexcept;
     float getGainReductionPercent() const noexcept;
     float getCurrentDuck() const noexcept;
+    float getCurrentPhase() const noexcept;
     double getSampleRate() const noexcept { return currentSampleRate; }
     bool isSidechainConnected() const noexcept;
 
@@ -78,11 +79,13 @@ private:
     std::atomic<float> gainReductionDb { 0.0f };
     std::atomic<float> gainReduction { 0.0f };
     std::atomic<float> currentDuck { 0.0f };
+    std::atomic<float> currentPhase { 0.0f };
     std::atomic<bool> sidechainConnected { false };
 
     double currentSampleRate = 44100.0;
     float phase = 0.0f;
     float kickEnvelope = 0.0f;
+    bool kickCycleArmed = true;
 
     // Two preallocated curve buffers. The GUI writes only the inactive one.
     // Audio reserves the active one for a block, copies it to a local fixed

@@ -25,6 +25,7 @@ private:
         void setPoints(const std::vector<DuckingCurve::Point>&);
         void setWaveformsFromProcessor(KickDuck1AudioProcessor&, int samplesToCopy);
         void setAmount(float normalizedAmount);
+        void setLength(float musicalLength);
         void setPhase(float normalizedPhase);
 
         std::function<void(const std::vector<DuckingCurve::Point>&)> onPointsChanged;

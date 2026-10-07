@@ -29,8 +29,8 @@ KickDuck1AudioProcessor::KickDuck1AudioProcessor()
       apvts(*this, nullptr, "PARAMETERS", createParameterLayout()),
       waveformHistory(96000)
 {
-    audioCurveCache[0] = {0.0f, 1.0f};
-    audioCurveCache[1] = {1.0f, 1.0f};
+    audioCurveCache[0] = {0.0f, 0.0f};
+    audioCurveCache[1] = {1.0f, 0.0f};
     publishCurve(duckingCurve.getPoints());
 }
 
@@ -55,6 +55,7 @@ void KickDuck1AudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
     currentSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
     phase = 0.0f;
     kickEnvelope = 0.0f;
+    kickCycleArmed = true;
     waveformHistory.clear();
 
     inputPeak.store(-60.0f, std::memory_order_relaxed);
@@ -69,6 +70,7 @@ void KickDuck1AudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
     gainReductionDb.store(0.0f, std::memory_order_relaxed);
     gainReduction.store(0.0f, std::memory_order_relaxed);
     currentDuck.store(0.0f, std::memory_order_relaxed);
+    currentPhase.store(0.0f, std::memory_order_relaxed);
     sidechainConnected.store(false, std::memory_order_relaxed);
     curveBufferState[0].store(0, std::memory_order_release);
     curveBufferState[1].store(0, std::memory_order_release);
@@ -96,7 +98,7 @@ float KickDuck1AudioProcessor::runtimeCurveValueAt(
     float x) const noexcept
 {
     x = clamp01(x);
-    if (count <= 0) return 1.0f;
+    if (count <= 0) return 0.0f;
     if (count == 1) return clamp01(curve[0].y);
     if (x <= curve[0].x) return clamp01(curve[0].y);
     if (x >= curve[count - 1].x) return clamp01(curve[count - 1].y);
@@ -127,8 +129,8 @@ void KickDuck1AudioProcessor::publishCurve(const std::vector<DuckingCurve::Point
     }
     if (count == 0)
     {
-        safe[0] = { 0.0f, 1.0f };
-        safe[1] = { 1.0f, 1.0f };
+        safe[0] = { 0.0f, 0.0f };
+        safe[1] = { 1.0f, 0.0f };
         count = 2;
     }
 
@@ -214,13 +216,30 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
             if (position->getBpm().hasValue()) bpm = *position->getBpm();
     if (!std::isfinite(bpm) || bpm <= 0.0) bpm = 120.0;
 
-    // LENGTH is musical: 0.125 = 1/8 beat, 0.25 = 1/4, 0.5 = 1/2, 1 = 1 beat, etc.
-    const double cycleSeconds = std::max(0.001, static_cast<double>(length) / (bpm / 60.0));
-    const float phaseIncrement = static_cast<float>(1.0 / (cycleSeconds * currentSampleRate));
+    // The graph/timebase is fixed. LENGTH no longer stretches the waveform or
+    // the phase clock. It controls where the second curve point sits: the
+    // longer the setting, the longer the kick keeps the bass suppressed before
+    // the recovery part of the curve begins.
+    const double displayWindowSeconds = 2.0 / (bpm / 60.0);
+    const float phaseIncrement = static_cast<float>(1.0 /
+        (std::max(0.001, displayWindowSeconds) * currentSampleRate));
+
+    // Keep the editable curve ordered while making LENGTH the musical position
+    // of point #2. 0.125..2 beats maps to 0.05..0.68 of the fixed two-beat
+    // ducking window. The remaining part is always available for recovery.
+    const float lengthNorm = clamp01((length - 0.125f) / (2.0f - 0.125f));
+    const float lengthPointX = 0.05f + lengthNorm * 0.63f;
     const float attackCoeff = attackMs <= 0.001f
         ? 0.0f
         : std::exp(-1.0f / (static_cast<float>(currentSampleRate) * attackMs * 0.001f));
     const float releaseCoeff = std::exp(-1.0f / (static_cast<float>(currentSampleRate) * std::max(0.001f, releaseMs) * 0.001f));
+
+    auto effectiveCurve = localCurve;
+    if (curveCount >= 2)
+    {
+        effectiveCurve[1].x = juce::jlimit(effectiveCurve[0].x + 0.002f,
+                                           0.68f, lengthPointX);
+    }
 
     float blockInputPeak = 0.0f, blockOutputPeak = 0.0f;
     float blockKickPeak = 0.0f, blockBassPeak = 0.0f, blockGainReduction = 0.0f;
@@ -243,11 +262,32 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         else
             kickEnvelope = releaseCoeff * kickEnvelope + (1.0f - releaseCoeff) * kickAbs;
 
-        const float detector = clamp01(kickEnvelope * 2.5f);
-        phase += phaseIncrement;
-        if (phase >= 1.0f) phase -= std::floor(phase);
+        // Kick onset starts a fresh ducking cycle. LENGTH therefore has a
+        // musical and immediately audible meaning: it is the duration of
+        // the complete duck/recovery curve after each kick.
+        const float triggerOn = 0.02f;
+        const float triggerOff = 0.008f;
+        if (kickCycleArmed && std::max(kickAbs, kickEnvelope) >= triggerOn)
+        {
+            phase = 0.0f;
+            kickCycleArmed = false;
+        }
+        else if (!kickCycleArmed && kickEnvelope <= triggerOff)
+        {
+            kickCycleArmed = true;
+        }
 
-        const float curve = runtimeCurveValueAt(localCurve, curveCount, phase);
+        // Use the raw kick transient together with the smoothed envelope. This
+        // makes the first loud part of the kick capable of reaching maximum
+        // ducking immediately instead of waiting for the envelope attack.
+        const float detector = clamp01(std::max(kickAbs, kickEnvelope) * 8.0f);
+
+        phase += phaseIncrement;
+        if (phase > 1.0f)
+            phase = 1.0f;
+
+        // Curve Y is duck depth: 0 = no reduction, 1 = maximum reduction.
+        const float curve = runtimeCurveValueAt(effectiveCurve, curveCount, phase);
         const float reduction = clamp01(amount * curve * detector);
         const float duck = 1.0f - reduction;
         blockGainReduction = std::max(blockGainReduction, reduction);
@@ -285,6 +325,7 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         // Fixed-capacity atomic DSP history. No vector, mutex or allocation.
         waveformHistory.push(bassInMono, bassOutMono, kickSample);
         currentDuck.store(reduction, std::memory_order_relaxed);
+        currentPhase.store(phase, std::memory_order_relaxed);
     }
 
     const float inputRmsLinear = static_cast<float>(std::sqrt(inputSumSquares / numSamples));
@@ -323,6 +364,7 @@ float KickDuck1AudioProcessor::getGainReduction() const noexcept { return getGai
 float KickDuck1AudioProcessor::getGainReductionDb() const noexcept { return gainReductionDb.load(std::memory_order_relaxed); }
 float KickDuck1AudioProcessor::getGainReductionPercent() const noexcept { return gainReduction.load(std::memory_order_relaxed); }
 float KickDuck1AudioProcessor::getCurrentDuck() const noexcept { return currentDuck.load(std::memory_order_relaxed); }
+float KickDuck1AudioProcessor::getCurrentPhase() const noexcept { return currentPhase.load(std::memory_order_relaxed); }
 bool KickDuck1AudioProcessor::isSidechainConnected() const noexcept { return sidechainConnected.load(std::memory_order_relaxed); }
 
 void KickDuck1AudioProcessor::copyWaveformSnapshot(float* bassIn, float* bassOut, float* kick,

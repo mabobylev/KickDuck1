@@ -25,14 +25,15 @@ namespace
 
     std::vector<DuckingCurve::Point> defaultCurve()
     {
-        // Stored DSP y: 1 = unity/no ducking, 0 = maximum ducking.
-        // The editor draws this inverted, so both ends are visually at the bottom.
+        // DSP/GUI y is duck depth: 0 = no reduction, 1 = maximum reduction.
+        // The kick starts at maximum duck depth, holds it through point #2,
+        // then the remaining points define the bass recovery.
         return {
             { 0.00f, 1.00f },
-            { 0.18f, 0.86f },
-            { 0.72f, 0.22f },
-            { 0.93f, 0.10f },
-            { 1.00f, 1.00f }
+            { 0.18f, 1.00f },
+            { 0.72f, 0.58f },
+            { 0.93f, 0.12f },
+            { 1.00f, 0.00f }
         };
     }
 
@@ -71,7 +72,18 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(KickDuck1AudioProce
     setResizeLimits(1050, 680, 1800, 1100);
 
     auto curve = processor.getCurvePoints();
-    if (isUnityCurve(curve))
+    bool needsDefaultCurve = isUnityCurve(curve);
+    if (!needsDefaultCurve && curve.size() == 5)
+    {
+        // Migrate the previous UI6 default, whose first point was no-duck.
+        needsDefaultCurve = std::abs(curve[0].x - 0.00f) < 0.01f
+                          && std::abs(curve[0].y - 0.00f) < 0.01f
+                          && std::abs(curve[1].x - 0.18f) < 0.02f
+                          && std::abs(curve[1].y - 0.14f) < 0.03f
+                          && std::abs(curve[2].x - 0.72f) < 0.02f;
+    }
+
+    if (needsDefaultCurve)
     {
         curve = defaultCurve();
         processor.setCurvePoints(curve);
@@ -212,7 +224,11 @@ void KickDuck1AudioProcessorEditor::paint(juce::Graphics& g)
     g.setColour(muted);
     g.drawText("LEVELS", meters.getX() + 14, meters.getY() + 10, 100, 18, juce::Justification::left);
 
-    auto m = meters.reduced(12.0f, 35.0f);
+    // Keep the three meters compact and high in the panel. The lower part
+    // is reserved for readable RMS/LUFS, kick and sidechain readouts.
+    auto m = meters.withTrimmedTop(38.0f)
+                   .withHeight(290.0f)
+                   .reduced(12.0f, 0.0f);
     const float gap = 8.0f;
     const float w = (m.getWidth() - gap * 2.0f) / 3.0f;
     auto inputMeter = m.removeFromLeft(w);
@@ -226,7 +242,7 @@ void KickDuck1AudioProcessorEditor::paint(juce::Graphics& g)
     drawMeter(g, grMeter, processor.getGainReductionDb(), "GR", grDbText, true);
 
     auto readouts = meters.reduced(12.0f, 0.0f);
-    readouts = readouts.withTop(readouts.getBottom() - 118.0f);
+    readouts = readouts.withTop(readouts.getBottom() - 102.0f);
     const float rw = (readouts.getWidth() - 8.0f) * 0.5f;
     auto inRead = readouts.removeFromLeft(rw);
     readouts.removeFromLeft(8.0f);
@@ -304,7 +320,7 @@ void KickDuck1AudioProcessorEditor::drawMeter(juce::Graphics& g, juce::Rectangle
     g.drawText(title, area.getX(), area.getY() + 7, area.getWidth(), 15, juce::Justification::centred);
 
     auto bar = area.reduced(8.0f, 29.0f);
-    bar.removeFromBottom(30.0f);
+    bar.removeFromBottom(34.0f);
     g.setColour(juce::Colour::fromRGB(8, 11, 15));
     g.fillRoundedRectangle(bar, 4.0f);
 
@@ -328,7 +344,7 @@ void KickDuck1AudioProcessorEditor::drawMeter(juce::Graphics& g, juce::Rectangle
 
     g.setColour(text);
     g.setFont(font(10.0f, true));
-    g.drawText(value, area.getX(), area.getBottom() - 27, area.getWidth(), 18, juce::Justification::centred);
+    g.drawText(value, area.getX(), area.getBottom() - 25, area.getWidth(), 18, juce::Justification::centred);
 }
 
 void KickDuck1AudioProcessorEditor::drawReadout(juce::Graphics& g, juce::Rectangle<float> area,
@@ -361,7 +377,13 @@ void KickDuck1AudioProcessorEditor::updateMeters()
         : 0.75f;
 
     curveEditor.setAmount(amount);
-    curveEditor.setPhase(processor.getCurrentDuck());
+
+    const auto* lengthParam = processor.apvts.getRawParameterValue("length");
+    const float length = lengthParam != nullptr
+        ? lengthParam->load(std::memory_order_relaxed)
+        : 0.5f;
+    curveEditor.setLength(length);
+    curveEditor.setPhase(processor.getCurrentPhase());
 
     cacheNumber(inputPeakText, processor.getInputPeak(), " dB");
     cacheNumber(inputRmsText, processor.getInputRms(), " dB");
@@ -396,7 +418,26 @@ void KickDuck1AudioProcessorEditor::updateWaveform()
     if (!std::isfinite(sr) || sr <= 0.0)
         return;
 
-    const int samples = juce::jlimit(1, 96000, static_cast<int>(sr * 1.5));
+    // Display a fixed two-beat window. LENGTH must never stretch this waveform
+    // view; it changes only the timing of the duck curve.
+    double bpm = 120.0;
+    if (auto* playHead = processor.getPlayHead())
+    {
+        if (auto position = playHead->getPosition())
+            if (position->getBpm().hasValue())
+                bpm = *position->getBpm();
+    }
+
+    if (!std::isfinite(bpm) || bpm <= 0.0)
+        bpm = 120.0;
+
+    // LENGTH must not stretch the displayed audio. The graph always shows a
+    // fixed two-beat window so KICK and BASS OUT keep the same horizontal scale
+    // while LENGTH changes only the ducking curve.
+    const double cycleSeconds = juce::jlimit(0.35, 2.50, 2.0 / (bpm / 60.0));
+    const int samples = juce::jlimit(1, 96000,
+        static_cast<int>(std::round(sr * cycleSeconds)));
+
     curveEditor.setWaveformsFromProcessor(processor, samples);
 }
 
@@ -438,15 +479,48 @@ void KickDuck1AudioProcessorEditor::CurveEditor::normalizeWaveform(
         v = juce::jlimit(-1.0f, 1.0f, v * gain);
 }
 
+
 void KickDuck1AudioProcessorEditor::CurveEditor::setWaveformsFromProcessor(
     KickDuck1AudioProcessor& p, int samplesToCopy)
 {
     p.copyWaveformSnapshot(bassInWaveform.data(), bassOutWaveform.data(),
                            kickWaveform.data(), maxWaveformPoints, samplesToCopy);
 
-    // Visual-only normalization. DSP values are untouched.
-    normalizeWaveform(bassOutWaveform);
-    normalizeWaveform(kickWaveform);
+    // Visual-only scaling. Bass Out uses Bass In as a hidden reference so
+    // compression remains visible: we deliberately do NOT normalize Bass Out
+    // independently, otherwise a heavily compressed bass would look just as
+    // large as an uncompressed one. Kick gets its own display lift so its
+    // transient remains clearly visible.
+    float bassReferencePeak = 0.0f;
+    float kickPeak = 0.0f;
+    for (int i = 0; i < maxWaveformPoints; ++i)
+    {
+        bassReferencePeak = std::max(bassReferencePeak, std::abs(bassInWaveform[(size_t)i]));
+        kickPeak = std::max(kickPeak, std::abs(kickWaveform[(size_t)i]));
+    }
+
+    if (bassReferencePeak > 0.00001f)
+    {
+        const float gain = juce::jlimit(0.15f, 0.92f, 0.82f / bassReferencePeak);
+        for (float& v : bassOutWaveform)
+            v = juce::jlimit(-1.0f, 1.0f, v * gain);
+    }
+    else
+    {
+        bassOutWaveform.fill(0.0f);
+    }
+
+    if (kickPeak > 0.00001f)
+    {
+        const float gain = juce::jlimit(0.20f, 1.0f, 0.78f / kickPeak);
+        for (float& v : kickWaveform)
+            v = juce::jlimit(-1.0f, 1.0f, v * gain);
+    }
+    else
+    {
+        kickWaveform.fill(0.0f);
+    }
+
     repaint();
 }
 
@@ -454,6 +528,32 @@ void KickDuck1AudioProcessorEditor::CurveEditor::setAmount(float v)
 {
     amount = juce::jlimit(0.0f, 1.0f, v);
     repaint();
+}
+
+void KickDuck1AudioProcessorEditor::CurveEditor::setLength(float musicalLength)
+{
+    if (points.size() < 2)
+        return;
+
+    // LENGTH controls the horizontal position of point #2. The mapping is
+    // deliberately compressed so the full 1/8..2 beat range remains useful
+    // while leaving enough room after point #2 for the recovery curve.
+    const float n = juce::jlimit(0.0f, 1.0f,
+        (musicalLength - 0.125f) / (2.0f - 0.125f));
+    const float targetX = 0.05f + n * 0.63f;
+
+    float maxX = 0.98f;
+    if (points.size() > 2)
+        maxX = points[2].x - 0.002f;
+
+    maxX = std::max(points[0].x + 0.004f, maxX);
+    const float newX = juce::jlimit(points[0].x + 0.002f, maxX, targetX);
+    if (std::abs(points[1].x - newX) > 0.0005f)
+    {
+        points[1].x = newX;
+        notifyPointsChanged();
+        repaint();
+    }
 }
 
 void KickDuck1AudioProcessorEditor::CurveEditor::setPhase(float v)
@@ -479,9 +579,9 @@ juce::Point<float> KickDuck1AudioProcessorEditor::CurveEditor::pointToScreen(
 {
     auto b = graphBounds();
 
-    // DSP y=1 is unity/no ducking and is therefore drawn at the bottom.
-    // DSP y=0 is maximum ducking and is drawn at the top.
-    const float visual = (1.0f - point.y) * amount;
+    // y is directly the requested duck depth: 0 = bottom/no ducking,
+    // 1 = top/maximum ducking. Amount scales the visible depth.
+    const float visual = point.y * amount;
 
     return {
         b.getX() + point.x * b.getWidth(),
@@ -597,7 +697,7 @@ void KickDuck1AudioProcessorEditor::CurveEditor::paint(juce::Graphics& g)
 
     g.setColour(muted);
     g.setFont(font(8.5f, true));
-    g.drawText("1.5 s SNAPSHOT  •  DRAG POINTS  •  DOUBLE-CLICK ADD  •  RIGHT-CLICK DELETE",
+    g.drawText("ONE CYCLE  •  DRAG POINTS  •  DOUBLE-CLICK ADD  •  RIGHT-CLICK DELETE",
                b.getRight() - 440.0f, b.getBottom() - 19.0f, 430.0f, 15,
                juce::Justification::right);
 
@@ -658,9 +758,9 @@ void KickDuck1AudioProcessorEditor::CurveEditor::mouseDrag(const juce::MouseEven
             x = std::min(x, points[(size_t)selectedPoint + 1].x - 0.002f);
     }
 
-    float y = 1.0f;
+    float y = 0.0f;
     if (amount > 0.001f)
-        y = 1.0f - visual / amount;
+        y = visual / amount;
 
     points[(size_t)selectedPoint].x = juce::jlimit(0.0f, 1.0f, x);
     points[(size_t)selectedPoint].y = juce::jlimit(0.0f, 1.0f, y);
@@ -681,7 +781,7 @@ void KickDuck1AudioProcessorEditor::CurveEditor::mouseDoubleClick(const juce::Mo
 
     const float x = xToNorm(e.position.x);
     const float visual = screenYToVisualNorm(e.position.y);
-    const float y = amount > 0.001f ? 1.0f - visual / amount : 1.0f;
+    const float y = amount > 0.001f ? visual / amount : 0.0f;
 
     points.push_back({ x, juce::jlimit(0.0f, 1.0f, y) });
     std::sort(points.begin(), points.end(), [](const auto& a, const auto& b) { return a.x < b.x; });
