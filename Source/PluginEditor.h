@@ -3,115 +3,81 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 #include <array>
-#include <functional>
-#include <vector>
 
 class KickDuck1AudioProcessorEditor : public juce::AudioProcessorEditor,
                                       private juce::Timer
 {
 public:
     explicit KickDuck1AudioProcessorEditor(KickDuck1AudioProcessor&);
-    ~KickDuck1AudioProcessorEditor() override = default;
+    ~KickDuck1AudioProcessorEditor() override;
 
     void paint(juce::Graphics&) override;
     void resized() override;
 
 private:
-    class CurveDisplay : public juce::Component
+    class CurveEditor : public juce::Component
     {
     public:
-        CurveDisplay();
+        CurveEditor();
 
         void setPoints(const std::vector<DuckingCurve::Point>&);
-        void setWaveforms(const std::vector<float>& bassIn,
-                          const std::vector<float>& bassOut,
-                          const std::vector<float>& kick);
+        void setWaveforms(const float* bassIn, const float* bassOut, const float* kick);
+        void setWaveformsFromProcessor(KickDuck1AudioProcessor&, int samplesToCopy);
         void setAmount(float normalizedAmount);
-        void setPlayhead(float normalizedPhase);
-        void setCurrentDuck(float normalizedDuck);
-        void setSidechainConnected(bool);
+        void setPhase(float normalizedPhase);
 
         std::function<void(const std::vector<DuckingCurve::Point>&)> onPointsChanged;
 
         void paint(juce::Graphics&) override;
-        void mouseMove(const juce::MouseEvent&) override;
-        void mouseExit(const juce::MouseEvent&) override;
         void mouseDown(const juce::MouseEvent&) override;
         void mouseDrag(const juce::MouseEvent&) override;
         void mouseUp(const juce::MouseEvent&) override;
         void mouseDoubleClick(const juce::MouseEvent&) override;
 
     private:
-        static constexpr int maxWaveformPoints = 1200;
-
-        float xToNorm(float) const;
-        float yToNorm(float) const;
+        static constexpr int maxWaveformPoints = 1600;
+        juce::Rectangle<float> graphBounds() const;
+        float xToNorm(float x) const;
+        float yToNorm(float y) const;
         juce::Point<float> normToPoint(float x, float y) const;
         int findPoint(juce::Point<float>) const;
-        float curveValueAt(float x) const;
-        float displayedCurveValueAt(float x) const;
         void notifyPointsChanged();
-        void copyDownsampled(const std::vector<float>& source,
-                             std::array<float, maxWaveformPoints>& dest,
-                             int& count);
         void drawWaveform(juce::Graphics&, const std::array<float, maxWaveformPoints>&,
-                          int count, juce::Rectangle<float>, juce::Colour,
-                          float alpha) const;
+                          juce::Rectangle<float>, juce::Colour, float) const;
+        void drawSmoothCurve(juce::Graphics&, float scale, juce::Colour,
+                             float thickness, bool fill) const;
 
         std::vector<DuckingCurve::Point> points;
-        std::array<float, maxWaveformPoints> bassInWaveform{};
-        std::array<float, maxWaveformPoints> bassOutWaveform{};
-        std::array<float, maxWaveformPoints> kickWaveform{};
-        int bassInCount = 0, bassOutCount = 0, kickCount = 0;
-
+        std::array<float, maxWaveformPoints> bassInWaveform{}, bassOutWaveform{}, kickWaveform{};
         float amount = 0.75f;
-        float playhead = 0.0f;
-        float currentDuck = 0.0f;
-        bool sidechainConnected = false;
+        float phase = 0.0f;
         int selectedPoint = -1;
-        int hoveredPoint = -1;
         bool dragging = false;
-
-        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(CurveDisplay)
-    };
-
-    class MeterStrip : public juce::Component
-    {
-    public:
-        enum class Mode { Normal, GainReduction };
-        explicit MeterStrip(Mode m) : mode(m) {}
-        void setLevel(float v) { level = std::isfinite(v) ? v : -60.0f; repaint(); }
-        void setText(const juce::String& s) { readout = s; repaint(); }
-        void setTitle(const juce::String& s) { title = s; repaint(); }
-        void paint(juce::Graphics&) override;
-    private:
-        Mode mode;
-        float level = -60.0f;
-        juce::String title, readout;
     };
 
     void timerCallback() override;
     void updateWaveform();
     void updateMeters();
-    void setupKnob(juce::Slider&, juce::Label&, const juce::String&, bool major = false);
+    void setupKnob(juce::Slider&, juce::Label&, const juce::String&);
+    void setupValueLabel(juce::Label&);
     static juce::String formatDb(float);
+    static juce::String formatMs(float);
     static juce::String formatPercent(float);
-    static juce::String formatLength(float);
+
+    void drawMeter(juce::Graphics&, juce::Rectangle<float>, float levelDb,
+                   const juce::String& title, const juce::String& value,
+                   bool gainReduction) const;
+    void drawReadout(juce::Graphics&, juce::Rectangle<float>, const juce::String& title,
+                     const juce::String& main, const juce::String& sub,
+                     juce::Colour accent) const;
 
     KickDuck1AudioProcessor& processor;
-    CurveDisplay curveDisplay;
+    CurveEditor curveEditor;
 
-    juce::Slider amountSlider, lengthSlider, attackSlider, releaseSlider, mixSlider;
-    juce::Slider inputSlider, outputSlider;
-    juce::Label amountLabel, lengthLabel, attackLabel, releaseLabel, mixLabel;
-    juce::Label inputLabel, outputLabel;
-    juce::Label amountValue, lengthValue, attackValue, releaseValue, mixValue;
-    juce::Label inputValue, outputValue;
-    juce::Label sidechainStatus, grValue;
-
-    MeterStrip inputMeter{MeterStrip::Mode::Normal};
-    MeterStrip outputMeter{MeterStrip::Mode::Normal};
-    MeterStrip grMeter{MeterStrip::Mode::GainReduction};
+    juce::Slider amountSlider, lengthSlider, attackSlider, releaseSlider;
+    juce::Slider mixSlider, inputSlider, outputSlider;
+    juce::Label amountLabel, lengthLabel, attackLabel, releaseLabel;
+    juce::Label mixLabel, inputLabel, outputLabel;
 
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> amountAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> lengthAttachment;
@@ -121,9 +87,17 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> inputAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> outputAttachment;
 
-    // Reused every timer tick. The CurveDisplay converts these to fixed arrays.
-    std::vector<float> waveformBassInBuffer, waveformBassOutBuffer, waveformKickBuffer;
-    float visualPhase = 0.0f;
+    juce::Label inputPeakValue, inputRmsValue, inputLufsValue;
+    juce::Label outputPeakValue, outputRmsValue, outputLufsValue;
+    juce::Label kickPeakValue, kickRmsValue;
+    juce::Label grDbValue, grPercentValue, duckValue, sidechainStatus;
+
+    // Preallocated text cache: timer updates values, paint only reads them.
+    juce::String inputPeakText, inputRmsText, inputLufsText;
+    juce::String outputPeakText, outputRmsText, outputLufsText;
+    juce::String kickPeakText, kickRmsText, grDbText, grPercentText, duckText, sidechainText;
+
+    
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(KickDuck1AudioProcessorEditor)
 };

@@ -52,10 +52,13 @@ public:
     double getSampleRate() const noexcept { return currentSampleRate; }
     bool isSidechainConnected() const noexcept;
 
-    void copyWaveformHistory(std::vector<float>& bassIn,
-                             std::vector<float>& bassOut,
-                             std::vector<float>& kick,
-                             int samplesToCopy) const;
+    // GUI snapshot API: writes into caller-owned fixed arrays only.
+    // No std::vector mutation occurs here.
+    void copyWaveformSnapshot(float* bassIn,
+                              float* bassOut,
+                              float* kick,
+                              int points,
+                              int samplesToCopy) const noexcept;
 
     std::vector<DuckingCurve::Point> getCurvePoints() const;
     void setCurvePoints(const std::vector<DuckingCurve::Point>& points);
@@ -81,16 +84,22 @@ private:
     float phase = 0.0f;
     float kickEnvelope = 0.0f;
 
-    // Two fixed curve buffers. The UI edits the inactive buffer and then
-    // atomically swaps it in. The audio thread never touches a std::vector.
+    // Two preallocated curve buffers. The GUI writes only the inactive one.
+    // Audio reserves the active one for a block, copies it to a local fixed
+    // array, then releases it. This makes the double-buffer exchange safe.
     std::array<std::array<DuckingCurve::Point, maxCurvePoints>, 2> runtimeCurves {};
     std::array<std::atomic<int>, 2> runtimeCurveCounts { 0, 0 };
     std::atomic<int> activeCurveBuffer { 0 };
+    // 0 = free, 1 = audio reading, 2 = GUI writing.
+    std::array<std::atomic<int>, 2> curveBufferState { 0, 0 };
+    std::array<DuckingCurve::Point, maxCurvePoints> audioCurveCache {};
+    int audioCurveCacheCount = 2;
 
-    DuckingCurve duckingCurve;
+    DuckingCurve duckingCurve; // GUI/state-thread only; never touched by audio.
     WaveformHistory waveformHistory;
 
-    float runtimeCurveValueAt(float x) const noexcept;
+    float runtimeCurveValueAt(const std::array<DuckingCurve::Point, maxCurvePoints>& curve,
+                              int count, float x) const noexcept;
     void publishCurve(const std::vector<DuckingCurve::Point>& points);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(KickDuck1AudioProcessor)
