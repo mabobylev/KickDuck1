@@ -48,6 +48,138 @@ float process(KickDuck1AudioProcessor& p)
     return buffer.getSample(0, 0);
 }
 
+void musicalModeTests()
+{
+    struct Clock : juce::AudioPlayHead
+    {
+        double ppq = 0.0, bpm = 120.0;
+        bool playing = true;
+        juce::Optional<PositionInfo> getPosition() const override
+        {
+            PositionInfo info;
+            info.setBpm(bpm);
+            info.setPpqPosition(ppq);
+            info.setIsPlaying(playing);
+            return info;
+        }
+    } clock;
+    constexpr double beats[] {0.25, 0.5, 1.0, 2.0, 4.0};
+    for (double sr : {44100.0, 48000.0, 192000.0})
+        for (int block : {1, 17, 64, 512})
+            for (int division = 0; division < 5; ++division)
+            {
+                auto p = std::make_unique<KickDuck1AudioProcessor>();
+                prepare(*p);
+                parameter(*p, "automaticRouting", 0);
+                parameter(*p, "triggerMode", 2);
+                parameter(*p, "cycleDivision", static_cast<float>(division));
+                p->prepareToPlay(sr, block);
+                p->setPlayHead(&clock);
+                juce::MidiBuffer midi;
+                for (double ppq : {0.0, -0.125, 3.75, 0.0})
+                {
+                    clock.ppq = ppq;
+                    clock.playing = true;
+                    juce::AudioBuffer<float> buffer(4, block);
+                    buffer.clear();
+                    for (int i = 0; i < block; ++i) buffer.setSample(0, i, 0.5f);
+                    p->processBlock(buffer, midi);
+                    require(std::abs(p->getCycleSeconds() - beats[division] * 0.5) < 1.0e-8,
+                            "Musical division duration wrong");
+                    const double phase = ppq / beats[division] - std::floor(ppq / beats[division]);
+                    const double expected = std::fmod(phase + block / (sr * beats[division] * 0.5), 1.0);
+                    require(std::abs(p->getCurrentPhase() - (expected - 1.0 / (sr * beats[division] * 0.5) + 1.0)) < 1.0e-4
+                            || std::abs(p->getCurrentPhase() - (expected - 1.0 / (sr * beats[division] * 0.5))) < 1.0e-4,
+                            "Host Sync phase does not follow PPQ/seek");
+                }
+                clock.playing = false;
+                for (int n = 0; n < static_cast<int>(sr * 0.003) + 1; ++n)
+                {
+                    juce::AudioBuffer<float> buffer(4, 1);
+                    buffer.clear();
+                    buffer.setSample(0, 0, 0.5f);
+                    buffer.setSample(2, 0, 1.0f);
+                    p->processBlock(buffer, midi);
+                    if (n == static_cast<int>(sr * 0.003))
+                        require(std::abs(buffer.getSample(0, 0) - 0.5f) < 1.0e-5f,
+                                "Stopped Host Sync did not release to dry or reacted to AUX");
+                }
+                p->setPlayHead(nullptr);
+            }
+    auto automatic = std::make_unique<KickDuck1AudioProcessor>();
+    prepare(*automatic);
+    automatic->setPlayHead(&clock);
+    clock.playing = true;
+    clock.ppq = 0.0;
+    juce::MidiBuffer autoMidi;
+    juce::AudioBuffer<float> autoBuffer(4, 512);
+    autoBuffer.clear();
+    for (int i = 0; i < 512; ++i) autoBuffer.setSample(0, i, 0.5f);
+    automatic->processBlock(autoBuffer, autoMidi);
+    require(autoBuffer.getSample(0, 511) == 0.5f, "Connected silent AUX incorrectly switched to Host Sync");
+    autoBuffer.clear();
+    autoBuffer.setSample(0, 0, 0.5f);
+    autoBuffer.setSample(2, 0, 1.0f);
+    automatic->processBlock(autoBuffer, autoMidi);
+    require(std::abs(autoBuffer.getSample(0, 0) - 0.15f) < 1.0e-5f,
+            "Automatic connected AUX did not trigger from kick");
+    auto autoLayout = automatic->getBusesLayout();
+    autoLayout.inputBuses.set(1, juce::AudioChannelSet::disabled());
+    require(automatic->setBusesLayout(autoLayout), "Automatic AUX disconnect rejected");
+    parameter(*automatic, "cycleDivision", 4);
+    automatic->prepareToPlay(48000, 512);
+    autoBuffer.setSize(2, 512);
+    autoBuffer.clear();
+    for (int i = 0; i < 512; ++i) autoBuffer.setSample(0, i, 0.5f);
+    automatic->processBlock(autoBuffer, autoMidi);
+    require(std::abs(autoBuffer.getSample(0, 0) - 0.15f) < 1.0e-5f,
+            "Automatic disconnected AUX did not select Host Sync");
+    require(std::abs(automatic->getCycleSeconds() - 0.5) < 1.0e-8,
+            "Automatic routing still used removed cycle division");
+    clock.playing = false;
+    autoBuffer.clear();
+    for (int i = 0; i < 512; ++i) autoBuffer.setSample(0, i, 0.5f);
+    automatic->processBlock(autoBuffer, autoMidi);
+    require(std::abs(autoBuffer.getSample(0, 511) - 0.5f) < 1.0e-5f,
+            "Automatic Host Sync did not release when stopped");
+    automatic->setPlayHead(nullptr);
+    auto p = std::make_unique<KickDuck1AudioProcessor>();
+    auto layout = p->getBusesLayout();
+    layout.inputBuses.set(1, juce::AudioChannelSet::disabled());
+    require(p->setBusesLayout(layout), "Disabled AUX rejected");
+    parameter(*p, "automaticRouting", 0);
+    parameter(*p, "triggerMode", 1);
+    p->prepareToPlay(48000, 512);
+    juce::AudioBuffer<float> buffer(2, 512);
+    buffer.clear();
+    for (int i = 0; i < 512; ++i) buffer.setSample(0, i, 0.5f);
+    juce::MidiBuffer midi;
+    p->processBlock(buffer, midi);
+    require(buffer.getSample(0, 511) == 0.5f, "Audio Trigger started without AUX");
+    parameter(*p, "triggerMode", 2);
+    parameter(*p, "cycleDivision", 4);
+    juce::MemoryBlock data;
+    p->getStateInformation(data);
+    auto restored = std::make_unique<KickDuck1AudioProcessor>();
+    restored->setStateInformation(data.getData(), static_cast<int>(data.getSize()));
+    require(restored->apvts.getRawParameterValue("triggerMode")->load() == 2
+            && restored->apvts.getRawParameterValue("cycleDivision")->load() == 4,
+            "Musical mode state round trip failed");
+    auto legacy = p->apvts.copyState();
+    for (int i = legacy.getNumChildren() - 1; i >= 0; --i)
+        if (legacy.getChild(i).getProperty("id") == juce::var("triggerMode")
+            || legacy.getChild(i).getProperty("id") == juce::var("cycleDivision")
+            || legacy.getChild(i).getProperty("id") == juce::var("automaticRouting"))
+            legacy.removeChild(i, nullptr);
+    juce::AudioProcessor::copyXmlToBinary(*legacy.createXml(), data);
+    restored->setStateInformation(data.getData(), static_cast<int>(data.getSize()));
+    require(restored->apvts.getRawParameterValue("triggerMode")->load() == 0
+            && restored->apvts.getRawParameterValue("cycleDivision")->load() == 2,
+            "Legacy state did not restore Auto quarter-note mode");
+    require(restored->apvts.getRawParameterValue("automaticRouting")->load() == 0,
+            "Legacy routing semantics changed during load");
+}
+
 void stateTests()
 {
     auto source = std::make_unique<KickDuck1AudioProcessor>();
@@ -1009,6 +1141,7 @@ void bpmOfflineAndTimingLimitsTests()
         auto p = std::make_unique<KickDuck1AudioProcessor>();
         auto layout = p->getBusesLayout();
         layout.inputBuses.set(1, juce::AudioChannelSet::disabled());
+        parameter(*p, "automaticRouting", 0);
         require(p->setBusesLayout(layout), "AUX disabled layout rejected");
         p->prepareToPlay(48000.0, block);
         const auto curve = p->getCurvePoints();
@@ -1325,6 +1458,7 @@ int main()
     const juce::ScopedJuceInitialiser_GUI juceInitialiser;
     try
     {
+        musicalModeTests();
         stateTests();
         normalizationTests();
         headlessAndMixTests();

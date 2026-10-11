@@ -275,7 +275,23 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
         updateMeters();
     };
     addChildComponent(legacyMixButton);
-    lengthSlider.setTooltip("Position of point 2: Length / 2 of one beat. Does not delay the trigger.");
+    triggerModeLabel.setName("Trigger Mode");
+    triggerModeLabel.setFont(font(12.0f, true));
+    triggerModeLabel.setColour(juce::Label::textColourId, bassOutColour);
+    triggerModeLabel.setJustificationType(juce::Justification::centred);
+    triggerModeLabel.setTooltip("Selected by AUX connection, not by silence between kick hits. Legacy saved mode is retained until USE CONNECTION is clicked.");
+    addAndMakeVisible(triggerModeLabel);
+    addChildComponent(automaticRoutingButton);
+    automaticRoutingButton.setTooltip("Switch this saved project from its legacy mode to automatic selection by AUX connection.");
+    automaticRoutingButton.onClick = [this]
+    {
+        auto* p = processor.apvts.getParameter("automaticRouting");
+        p->beginChangeGesture();
+        p->setValueNotifyingHost(1.0f);
+        p->endChangeGesture();
+        updateMeters();
+    };
+    lengthSlider.setTooltip("Position of point 2: Length / 2 of the selected cycle. Does not delay the trigger.");
     releaseSlider.setTooltip("Time from the kick trigger to point 3 (recovery target). Not a compressor release constant.");
     attackSlider.setTooltip("Duration from the penultimate point to the end of the cycle. Not compressor attack or pre-delay.");
     for (int i = 0; i < DuckingCurve::presetCount; ++i)
@@ -422,7 +438,7 @@ void KickDuck1AudioProcessorEditor::paint(juce::Graphics& g)
     g.setColour(connected ? text : muted);
     g.setFont(font(10.5f, true));
     g.drawText(
-        connected ? "KICK AUX  |  ONLINE" : "KICK AUX OFF  |  BPM",
+        connected ? "KICK AUX  |  ONLINE" : "KICK AUX  |  OFFLINE",
         sx + 15.0f, 23.0f, 170.0f, 20.0f,
         juce::Justification::left);
 
@@ -554,6 +570,9 @@ void KickDuck1AudioProcessorEditor::resized()
         label.setBounds(cell.removeFromTop(20));
         slider.setBounds(cell.reduced(2, 0));
     };
+    auto modeRow = layout.shape.withTrimmedTop(130).reduced(8, 0).withHeight(25);
+    triggerModeLabel.setBounds(modeRow.reduced(2, 0));
+    automaticRoutingButton.setBounds(triggerModeLabel.getBounds());
     auto shape = layout.shape.withTrimmedTop(28).reduced(4, 0);
     // Keep timing controls close together even in a wide editor.
     const int cellWidth = std::min(110, shape.getWidth() / 4);
@@ -862,7 +881,16 @@ void KickDuck1AudioProcessorEditor::updateMeters()
     sidechainText =
         processor.isSidechainConnected()
             ? "SIDECHAIN ACTIVE"
-            : "BPM DUCKING";
+            : "AUX OFF";
+    const bool automatic = processor.apvts.getRawParameterValue("automaticRouting")->load() > 0.5f;
+    const bool connected = processor.isSidechainConnected();
+    const int legacyMode = static_cast<int>(processor.apvts.getRawParameterValue("triggerMode")->load());
+    const bool synced = automatic ? !connected : (legacyMode == 2 || (legacyMode == 0 && !connected));
+    const juce::String modeName = synced ? "HOST SYNC" : "AUDIO TRIGGER";
+    triggerModeLabel.setText(modeName, juce::dontSendNotification);
+    automaticRoutingButton.setVisible(!automatic);
+    sidechainText = modeName + (automatic ? "" : " | SAVED MODE");
+
 }
 
 void KickDuck1AudioProcessorEditor::updateWaveform()

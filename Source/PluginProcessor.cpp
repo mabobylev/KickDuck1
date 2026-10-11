@@ -48,6 +48,9 @@ KickDuck1AudioProcessor::createParameterLayout()
     parameters.push_back(std::make_unique<Parameter>("release", "Recover", juce::NormalisableRange<float>(10.0f, 4000.0f, 0.1f), 250.0f));
     parameters.push_back(std::make_unique<Parameter>("mix", "Mix", juce::NormalisableRange<float>(0.0f, 100.0f, 0.01f), 100.0f));
     parameters.push_back(std::make_unique<Parameter>("onsetAttack", "Attack", juce::NormalisableRange<float>(0.0f, 100.0f, 0.01f), 0.0f));
+    parameters.push_back(std::make_unique<juce::AudioParameterChoice>("triggerMode", "Trigger Mode", juce::StringArray{"Auto", "Audio Trigger", "Host Sync"}, 0));
+    parameters.push_back(std::make_unique<juce::AudioParameterChoice>("cycleDivision", "Cycle Division", juce::StringArray{"1/16", "1/8", "1/4", "1/2", "1 bar (4/4)"}, 2));
+    parameters.push_back(std::make_unique<juce::AudioParameterBool>("automaticRouting", "Automatic Routing", true));
     return { parameters.begin(), parameters.end() };
 }
 
@@ -222,28 +225,38 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         curveBufferState[curveBuffer].store(0, std::memory_order_release);
     }
 
+    const bool automaticRouting = apvts.getRawParameterValue("automaticRouting")->load() > 0.5f;
+    const int triggerMode = automaticRouting ? (hasKick ? 1 : 2)
+        : static_cast<int>(apvts.getRawParameterValue("triggerMode")->load());
+    const int division = juce::jlimit(0, 4, static_cast<int>(apvts.getRawParameterValue("cycleDivision")->load()));
+    constexpr double divisions[] {0.25, 0.5, 1.0, 2.0, 4.0};
+    // Keep the saved experimental division only for legacy routing states.
+    const double cycleBeats = automaticRouting ? 1.0 : divisions[division];
+    const bool bpmMode = triggerMode == 2 || (triggerMode == 0 && !hasKick);
+    bool transportPlaying = false;
     double bpm = 120.0;
     bool hasBeatPosition = false;
     double beatPhase = 0.0;
     if (auto* playHead = getPlayHead())
         if (auto position = playHead->getPosition())
         {
+            transportPlaying = position->getIsPlaying();
             if (position->getBpm().hasValue()) bpm = *position->getBpm();
             if (position->getIsPlaying() && position->getPpqPosition().hasValue())
             {
                 const double ppq = *position->getPpqPosition();
                 if (std::isfinite(ppq))
                 {
-                    beatPhase = ppq - std::floor(ppq);
+                    beatPhase = ppq / cycleBeats - std::floor(ppq / cycleBeats);
                     hasBeatPosition = true;
                 }
             }
         }
-    const bool resyncBeat = !hasKick && hasBeatPosition
+    const bool resyncBeat = bpmMode && hasBeatPosition
         && (phase >= 1.0 || std::abs(beatPhase - phase) > 0.1);
-    const bool enteringBpmMode = !hasKick && !bpmModeWasActive;
-    const bool leavingBpmMode = hasKick && bpmModeWasActive;
-    if (!hasKick)
+    const bool enteringBpmMode = bpmMode && !bpmModeWasActive;
+    const bool leavingBpmMode = !bpmMode && bpmModeWasActive;
+    if (bpmMode)
     {
         if (hasBeatPosition) phase = beatPhase;
         else if (enteringBpmMode) phase = 0.0;
@@ -253,12 +266,14 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         duckCycleActive = false;
         kickCycleArmed = true;
     }
-    bpmModeWasActive = !hasKick;
+    bpmModeWasActive = bpmMode;
+    const bool clockRunning = bpmMode && (triggerMode != 2 || transportPlaying);
+    if (bpmMode && !clockRunning) duckCycleActive = false;
     if (!std::isfinite(bpm) || bpm <= 0.0) bpm = 120.0;
 
-    // A kick starts one full beat. The curve remains active after the transient
+    // A trigger starts one selected musical cycle. The curve remains active after the transient
     // decays, so its recovery and final duck can both be heard.
-    const double windowSeconds = 60.0 / bpm;
+    const double windowSeconds = 60.0 / bpm * cycleBeats;
     cycleSeconds.store(windowSeconds, std::memory_order_relaxed);
     const double sr = currentSampleRate.load(std::memory_order_relaxed);
     const double phaseIncrement = 1.0 / (std::max(0.001, windowSeconds) * sr);
@@ -305,11 +320,11 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         // too, so those dips cannot manufacture new hits in the waveform.
         if (kickEnvelope <= triggerOff && kickSlowEnvelope <= triggerOn)
             kickCycleArmed = true;
-        const bool kickTriggered = hasKick && samplesSinceTrigger >= retriggerHoldSamples
+        const bool kickTriggered = !bpmMode && hasKick && samplesSinceTrigger >= retriggerHoldSamples
             && kickAbs >= triggerOn && (kickCycleArmed || freshOnset);
-        const bool beatTriggered = !hasKick && ((sample == 0 && (enteringBpmMode || resyncBeat))
+        const bool beatTriggered = clockRunning && ((sample == 0 && (enteringBpmMode || resyncBeat))
             || !duckCycleActive || phase >= 1.0 - phaseIncrement * 0.001);
-        if (!hasKick && phase >= 1.0 - phaseIncrement * 0.001) phase = std::max(0.0, phase - 1.0);
+        if (clockRunning && phase >= 1.0 - phaseIncrement * 0.001) phase = std::max(0.0, phase - 1.0);
         const bool triggered = kickTriggered || beatTriggered;
         if (triggered)
         {
@@ -397,8 +412,8 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         currentPhase.store(static_cast<float>(phase), std::memory_order_relaxed);
         if (duckCycleActive)
         {
-            phase = hasKick ? std::min(1.0, phase + phaseIncrement) : phase + phaseIncrement;
-            if (hasKick && phase >= 1.0) duckCycleActive = false;
+            phase = !bpmMode ? std::min(1.0, phase + phaseIncrement) : phase + phaseIncrement;
+            if (!bpmMode && phase >= 1.0) duckCycleActive = false;
         }
     }
 
@@ -538,7 +553,7 @@ bool KickDuck1AudioProcessor::tryCopyCurvePoints(
 void KickDuck1AudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
-    state.setProperty("stateVersion", 5, nullptr);
+    state.setProperty("stateVersion", 7, nullptr);
     state.setProperty("curveRounded", isCurveRounded(), nullptr);
     for (auto oldCurve = state.getChildWithName("DuckingCurve"); oldCurve.isValid();
          oldCurve = state.getChildWithName("DuckingCurve"))
@@ -593,6 +608,18 @@ void KickDuck1AudioProcessor::setStateInformation(const void* data, int sizeInBy
         parameterState.setProperty("id", "onsetAttack", nullptr);
         parameterState.setProperty("value", 0.0f, nullptr);
         state.addChild(parameterState, -1, nullptr);
+    }
+    for (const auto* id : {"triggerMode", "cycleDivision", "automaticRouting"})
+    {
+        bool found = false;
+        for (const auto& child : state) found = found || child.getProperty("id").toString() == id;
+        if (!found)
+        {
+            juce::ValueTree parameterState("PARAM");
+            parameterState.setProperty("id", id, nullptr);
+            parameterState.setProperty("value", juce::String(id) == "cycleDivision" ? 2 : 0, nullptr);
+            state.addChild(parameterState, -1, nullptr);
+        }
     }
     apvts.replaceState(state);
     if (version < 2 && points.size() >= 3)

@@ -119,6 +119,8 @@ private:
     SignalScope signalScope;
     juce::TextButton resetCurveButton {"RESET CURVE"};
     juce::TextButton legacyMixButton;
+    juce::Label triggerModeLabel;
+    juce::TextButton automaticRoutingButton {"USE CONNECTION"};
     std::array<std::unique_ptr<CurvePresetButton>, DuckingCurve::presetCount> presetButtons;
     juce::TooltipWindow tooltipWindow {this, 500};
 
