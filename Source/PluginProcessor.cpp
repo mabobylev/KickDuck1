@@ -12,7 +12,7 @@ namespace
     {
         if (!std::isfinite(value) || value <= 0.000001f)
             return -60.0f;
-        return juce::jlimit(-60.0f, 12.0f, 20.0f * std::log10(value));
+        return std::max(-60.0f, 20.0f * std::log10(value));
     }
 
     float clamp01(float value) noexcept
@@ -27,11 +27,12 @@ KickDuck1AudioProcessor::KickDuck1AudioProcessor()
         .withInput("Kick Sidechain", juce::AudioChannelSet::stereo(), false)
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       apvts(*this, nullptr, "PARAMETERS", createParameterLayout()),
-      waveformHistory(96000)
+      waveformHistory(524288)
 {
-    audioCurveCache[0] = {0.0f, 0.0f};
-    audioCurveCache[1] = {1.0f, 0.0f};
-    publishCurve(duckingCurve.getPoints());
+    const auto points = duckingCurve.getPoints();
+    audioCurveCacheCount = static_cast<int>(points.size());
+    std::copy(points.begin(), points.end(), audioCurveCache.begin());
+    publishCurve(points);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout
@@ -41,11 +42,12 @@ KickDuck1AudioProcessor::createParameterLayout()
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> parameters;
     parameters.push_back(std::make_unique<Parameter>("input", "Input", juce::NormalisableRange<float>(-24.0f, 24.0f, 0.01f), 0.0f));
     parameters.push_back(std::make_unique<Parameter>("output", "Output", juce::NormalisableRange<float>(-24.0f, 24.0f, 0.01f), 0.0f));
-    parameters.push_back(std::make_unique<Parameter>("amount", "Amount", juce::NormalisableRange<float>(0.0f, 100.0f, 0.01f), 75.0f));
+    parameters.push_back(std::make_unique<Parameter>("amount", "Amount", juce::NormalisableRange<float>(0.0f, 100.0f, 0.01f), 70.0f));
     parameters.push_back(std::make_unique<Parameter>("length", "Length", juce::NormalisableRange<float>(0.125f, 2.0f, 0.001f), 0.5f));
-    parameters.push_back(std::make_unique<Parameter>("attack", "Attack", juce::NormalisableRange<float>(0.0f, 100.0f, 0.01f), 8.0f));
-    parameters.push_back(std::make_unique<Parameter>("release", "Release", juce::NormalisableRange<float>(10.0f, 1000.0f, 0.1f), 220.0f));
+    parameters.push_back(std::make_unique<Parameter>("attack", "Tail", juce::NormalisableRange<float>(0.0f, 1000.0f, 0.01f), 50.0f));
+    parameters.push_back(std::make_unique<Parameter>("release", "Recover", juce::NormalisableRange<float>(10.0f, 4000.0f, 0.1f), 250.0f));
     parameters.push_back(std::make_unique<Parameter>("mix", "Mix", juce::NormalisableRange<float>(0.0f, 100.0f, 0.01f), 100.0f));
+    parameters.push_back(std::make_unique<Parameter>("onsetAttack", "Attack", juce::NormalisableRange<float>(0.0f, 100.0f, 0.01f), 0.0f));
     return { parameters.begin(), parameters.end() };
 }
 
@@ -53,10 +55,26 @@ void KickDuck1AudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
 {
     juce::ignoreUnused(samplesPerBlock);
     currentSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
-    phase = 0.0f;
+    phase = 1.0;
+    bpmModeWasActive = false;
+    duckCycleActive = false;
     kickEnvelope = 0.0f;
     kickCycleArmed = true;
+    kickSlowEnvelope = 0.0f;
+    samplesSinceTrigger = static_cast<int>(currentSampleRate.load() * 0.03);
+    smoothedReduction = 0.0f;
+    attackStartReduction = 0.0f;
+    const auto initialiseSmoother = [this](auto& smoother, const char* id, float scale)
+    {
+        smoother.reset(currentSampleRate.load(), 0.02);
+        smoother.setCurrentAndTargetValue(apvts.getRawParameterValue(id)->load() * scale);
+    };
+    initialiseSmoother(inputDbSmoother, "input", 1.0f);
+    initialiseSmoother(outputDbSmoother, "output", 1.0f);
+    initialiseSmoother(amountSmoother, "amount", 0.01f);
+    initialiseSmoother(mixSmoother, "mix", 0.01f);
     waveformHistory.clear();
+    triggeredWaveform.clear();
 
     inputPeak.store(-60.0f, std::memory_order_relaxed);
     outputPeak.store(-60.0f, std::memory_order_relaxed);
@@ -68,13 +86,18 @@ void KickDuck1AudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
     inputLufs.store(-60.0f, std::memory_order_relaxed);
     outputLufs.store(-60.0f, std::memory_order_relaxed);
     gainReductionDb.store(0.0f, std::memory_order_relaxed);
+    meterGainReductionDb.store(0.0f, std::memory_order_relaxed);
+    inputMeter.prepare(currentSampleRate.load());
+    outputMeter.prepare(currentSampleRate.load());
+    kickMeter.prepare(currentSampleRate.load());
+    displayedReduction = 0.0;
+    reductionMeterDecay = std::exp(-1.0 / (currentSampleRate.load() * 0.15));
     gainReduction.store(0.0f, std::memory_order_relaxed);
     currentDuck.store(0.0f, std::memory_order_relaxed);
     currentPhase.store(0.0f, std::memory_order_relaxed);
     sidechainConnected.store(false, std::memory_order_relaxed);
-    curveBufferState[0].store(0, std::memory_order_release);
-    curveBufferState[1].store(0, std::memory_order_release);
-    publishCurve(duckingCurve.getPoints());
+    // Curve publications stay valid across prepareToPlay; do not reset slot
+    // ownership while the GUI or state thread may be publishing an edit.
 }
 
 void KickDuck1AudioProcessor::releaseResources() {}
@@ -90,31 +113,6 @@ bool KickDuck1AudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts)
 
     const auto sidechain = layouts.getChannelSet(true, 1);
     return sidechain.isDisabled() || sidechain == juce::AudioChannelSet::mono() || sidechain == juce::AudioChannelSet::stereo();
-}
-
-float KickDuck1AudioProcessor::runtimeCurveValueAt(
-    const std::array<DuckingCurve::Point, maxCurvePoints>& curve,
-    int count,
-    float x) const noexcept
-{
-    x = clamp01(x);
-    if (count <= 0) return 0.0f;
-    if (count == 1) return clamp01(curve[0].y);
-    if (x <= curve[0].x) return clamp01(curve[0].y);
-    if (x >= curve[count - 1].x) return clamp01(curve[count - 1].y);
-
-    for (int i = 1; i < count; ++i)
-    {
-        const auto& a = curve[i - 1];
-        const auto& b = curve[i];
-        if (x <= b.x)
-        {
-            const float span = std::max(0.000001f, b.x - a.x);
-            const float t = juce::jlimit(0.0f, 1.0f, (x - a.x) / span);
-            return clamp01(a.y + (b.y - a.y) * t);
-        }
-    }
-    return clamp01(curve[count - 1].y);
 }
 
 void KickDuck1AudioProcessor::publishCurve(const std::vector<DuckingCurve::Point>& source)
@@ -138,11 +136,22 @@ void KickDuck1AudioProcessor::publishCurve(const std::vector<DuckingCurve::Point
               [](const auto& a, const auto& b) { return a.x < b.x; });
 
     const int active = activeCurveBuffer.load(std::memory_order_acquire);
-    const int next = 1 - active;
-
-    int expected = 0;
-    if (!curveBufferState[next].compare_exchange_strong(
-            expected, 2, std::memory_order_acquire, std::memory_order_relaxed))
+    int next = -1;
+    for (int candidate = 0; candidate < static_cast<int>(runtimeCurves.size()); ++candidate)
+    {
+        if (candidate == active)
+            continue;
+        int expected = 0;
+        if (curveBufferState[candidate].compare_exchange_strong(
+                expected, 2, std::memory_order_acquire, std::memory_order_relaxed))
+        {
+            next = candidate;
+            break;
+        }
+    }
+    // With serialized writers and one audio reader, one spare slot is free.
+    jassert(next >= 0);
+    if (next < 0)
         return;
 
     for (int i = 0; i < count; ++i)
@@ -165,12 +174,15 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     const float outputDb = apvts.getRawParameterValue("output")->load(std::memory_order_relaxed);
     const float amount = apvts.getRawParameterValue("amount")->load(std::memory_order_relaxed) * 0.01f;
     const float length = apvts.getRawParameterValue("length")->load(std::memory_order_relaxed);
+    const float onsetMs = apvts.getRawParameterValue("onsetAttack")->load(std::memory_order_relaxed);
     const float attackMs = apvts.getRawParameterValue("attack")->load(std::memory_order_relaxed);
     const float releaseMs = apvts.getRawParameterValue("release")->load(std::memory_order_relaxed);
     const float mix = apvts.getRawParameterValue("mix")->load(std::memory_order_relaxed) * 0.01f;
 
-    const float inputGain = dbToLinear(inputDb);
-    const float outputGain = dbToLinear(outputDb);
+    inputDbSmoother.setTargetValue(inputDb);
+    outputDbSmoother.setTargetValue(outputDb);
+    amountSmoother.setTargetValue(amount);
+    mixSmoother.setTargetValue(mix);
 
     auto bassBuffer = getBusBuffer(buffer, true, 0);
     auto kickBuffer = getBusBuffer(buffer, true, 1);
@@ -211,39 +223,57 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     }
 
     double bpm = 120.0;
+    bool hasBeatPosition = false;
+    double beatPhase = 0.0;
     if (auto* playHead = getPlayHead())
         if (auto position = playHead->getPosition())
+        {
             if (position->getBpm().hasValue()) bpm = *position->getBpm();
+            if (position->getIsPlaying() && position->getPpqPosition().hasValue())
+            {
+                const double ppq = *position->getPpqPosition();
+                if (std::isfinite(ppq))
+                {
+                    beatPhase = ppq - std::floor(ppq);
+                    hasBeatPosition = true;
+                }
+            }
+        }
+    const bool resyncBeat = !hasKick && hasBeatPosition
+        && (phase >= 1.0 || std::abs(beatPhase - phase) > 0.1);
+    const bool enteringBpmMode = !hasKick && !bpmModeWasActive;
+    const bool leavingBpmMode = hasKick && bpmModeWasActive;
+    if (!hasKick)
+    {
+        if (hasBeatPosition) phase = beatPhase;
+        else if (enteringBpmMode) phase = 0.0;
+    }
+    else if (leavingBpmMode)
+    {
+        duckCycleActive = false;
+        kickCycleArmed = true;
+    }
+    bpmModeWasActive = !hasKick;
     if (!std::isfinite(bpm) || bpm <= 0.0) bpm = 120.0;
 
-    // The graph/timebase is fixed. LENGTH no longer stretches the waveform or
-    // the phase clock. It controls where the second curve point sits: the
-    // longer the setting, the longer the kick keeps the bass suppressed before
-    // the recovery part of the curve begins.
-    const double displayWindowSeconds = 2.0 / (bpm / 60.0);
-    const float phaseIncrement = static_cast<float>(1.0 /
-        (std::max(0.001, displayWindowSeconds) * currentSampleRate));
+    // A kick starts one full beat. The curve remains active after the transient
+    // decays, so its recovery and final duck can both be heard.
+    const double windowSeconds = 60.0 / bpm;
+    cycleSeconds.store(windowSeconds, std::memory_order_relaxed);
+    const double sr = currentSampleRate.load(std::memory_order_relaxed);
+    const double phaseIncrement = 1.0 / (std::max(0.001, windowSeconds) * sr);
+    // Detector release is separate from the curve's ATTACK/RELEASE handles.
+    const float detectorDecay = std::exp(-1.0f / static_cast<float>(sr * 0.003));
+    const float slowDetectorDecay = std::exp(-1.0f / static_cast<float>(sr * 0.08));
+    const int retriggerHoldSamples = std::max(1, static_cast<int>(sr * 0.03));
+    const float reductionStep = 1.0f / static_cast<float>(sr * 0.002);
 
-    // Keep the editable curve ordered while making LENGTH the musical position
-    // of point #2. 0.125..2 beats maps to 0.05..0.68 of the fixed two-beat
-    // ducking window. The remaining part is always available for recovery.
-    const float lengthNorm = clamp01((length - 0.125f) / (2.0f - 0.125f));
-    const float lengthPointX = 0.05f + lengthNorm * 0.63f;
-    const float attackCoeff = attackMs <= 0.001f
-        ? 0.0f
-        : std::exp(-1.0f / (static_cast<float>(currentSampleRate) * attackMs * 0.001f));
-    const float releaseCoeff = std::exp(-1.0f / (static_cast<float>(currentSampleRate) * std::max(0.001f, releaseMs) * 0.001f));
-
+    const bool rounded = isCurveRounded();
     auto effectiveCurve = localCurve;
-    if (curveCount >= 2)
-    {
-        effectiveCurve[1].x = juce::jlimit(effectiveCurve[0].x + 0.002f,
-                                           0.68f, lengthPointX);
-    }
+    DuckingCurve::applyControls(effectiveCurve.data(), curveCount,
+                               length, attackMs, releaseMs, windowSeconds, onsetMs);
 
-    float blockInputPeak = 0.0f, blockOutputPeak = 0.0f;
-    float blockKickPeak = 0.0f, blockBassPeak = 0.0f, blockGainReduction = 0.0f;
-    double inputSumSquares = 0.0, outputSumSquares = 0.0, kickSumSquares = 0.0;
+    float blockGainReduction = 0.0f;
 
     for (int sample = 0; sample < numSamples; ++sample)
     {
@@ -253,97 +283,138 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
                 ? kickBuffer.getSample(0, sample)
                 : 0.5f * (kickBuffer.getSample(0, sample) + kickBuffer.getSample(1, sample));
 
-        const float kickAbs = std::abs(kickSample);
-        blockKickPeak = std::max(blockKickPeak, kickAbs);
-        kickSumSquares += static_cast<double>(kickSample) * kickSample;
-
-        if (kickAbs > kickEnvelope)
-            kickEnvelope = attackCoeff * kickEnvelope + (1.0f - attackCoeff) * kickAbs;
-        else
-            kickEnvelope = releaseCoeff * kickEnvelope + (1.0f - releaseCoeff) * kickAbs;
-
-        // Kick onset starts a fresh ducking cycle. LENGTH therefore has a
-        // musical and immediately audible meaning: it is the duration of
-        // the complete duck/recovery curve after each kick.
-        const float triggerOn = 0.02f;
-        const float triggerOff = 0.008f;
-        if (kickCycleArmed && std::max(kickAbs, kickEnvelope) >= triggerOn)
-        {
-            phase = 0.0f;
-            kickCycleArmed = false;
-        }
-        else if (!kickCycleArmed && kickEnvelope <= triggerOff)
-        {
+        const float kickAbs = kickChannels == 2
+            ? std::max(std::abs(kickBuffer.getSample(0, sample)),
+                       std::abs(kickBuffer.getSample(1, sample)))
+            : std::abs(kickSample);
+        const double kickPower = kickChannels == 2
+            ? (static_cast<double>(kickBuffer.getSample(0, sample)) * kickBuffer.getSample(0, sample)
+               + static_cast<double>(kickBuffer.getSample(1, sample)) * kickBuffer.getSample(1, sample)) * 0.5
+            : static_cast<double>(kickSample) * kickSample;
+        kickMeter.push(kickAbs, kickPower);
+        constexpr float triggerOn = 0.02f;
+        constexpr float triggerOff = 0.008f;
+        // Compare with the previous slow peak before the new transient updates it.
+        // This detects a fresh hit over a tail, without treating zero crossings
+        // as silence. The hold prevents multiple triggers within one transient.
+        const bool freshOnset = kickAbs >= triggerOn && kickAbs > kickSlowEnvelope * 1.6f;
+        kickEnvelope = std::max(kickAbs, kickEnvelope * detectorDecay);
+        kickSlowEnvelope = std::max(kickAbs, kickSlowEnvelope * slowDetectorDecay);
+        // A decaying sinusoidal tail can briefly dip below the fast threshold
+        // between half-waves. Require the slow peak to leave the trigger range
+        // too, so those dips cannot manufacture new hits in the waveform.
+        if (kickEnvelope <= triggerOff && kickSlowEnvelope <= triggerOn)
             kickCycleArmed = true;
+        const bool kickTriggered = hasKick && samplesSinceTrigger >= retriggerHoldSamples
+            && kickAbs >= triggerOn && (kickCycleArmed || freshOnset);
+        const bool beatTriggered = !hasKick && ((sample == 0 && (enteringBpmMode || resyncBeat))
+            || !duckCycleActive || phase >= 1.0 - phaseIncrement * 0.001);
+        if (!hasKick && phase >= 1.0 - phaseIncrement * 0.001) phase = std::max(0.0, phase - 1.0);
+        const bool triggered = kickTriggered || beatTriggered;
+        if (triggered)
+        {
+            attackStartReduction = smoothedReduction;
+            if (kickTriggered) phase = 0.0;
+            duckCycleActive = true;
+            kickCycleArmed = false;
+            samplesSinceTrigger = 0;
+            const int frameSamples = static_cast<int>(juce::jlimit(1.0, 2147483647.0,
+                                                                  std::round(windowSeconds * sr)));
+            triggeredWaveform.trigger(frameSamples, windowSeconds);
         }
+        if (samplesSinceTrigger < retriggerHoldSamples)
+            ++samplesSinceTrigger;
 
-        // Use the raw kick transient together with the smoothed envelope. This
-        // makes the first loud part of the kick capable of reaching maximum
-        // ducking immediately instead of waiting for the envelope attack.
-        const float detector = clamp01(std::max(kickAbs, kickEnvelope) * 8.0f);
-
-        phase += phaseIncrement;
-        if (phase > 1.0f)
-            phase = 1.0f;
-
-        // Curve Y is duck depth: 0 = no reduction, 1 = maximum reduction.
-        const float curve = runtimeCurveValueAt(effectiveCurve, curveCount, phase);
-        const float reduction = clamp01(amount * curve * detector);
+        const float inputGain = dbToLinear(inputDbSmoother.getNextValue());
+        const float outputGain = dbToLinear(outputDbSmoother.getNextValue());
+        const float sampleAmount = amountSmoother.getNextValue();
+        const float sampleMix = mixSmoother.getNextValue();
+        // Bound discontinuities from curve edits, geometry automation and the
+        // end of the cycle. Attack=0 retains immediate first-sample ducking.
+        const float curve = DuckingCurve::sample(effectiveCurve.data(), curveCount, static_cast<float>(phase), rounded);
+        float targetReduction = duckCycleActive ? clamp01(sampleAmount * curve) : 0.0f;
+        float step = reductionStep;
+        if (duckCycleActive && effectiveCurve[0].x > 0.0f && phase < effectiveCurve[0].x)
+        {
+            const float t = static_cast<float>(phase) / effectiveCurve[0].x;
+            const float progress = rounded ? t * t * (3.0f - 2.0f * t) : t;
+            // Retrigger from the current gain, avoiding a jump back to dry.
+            targetReduction += attackStartReduction * (1.0f - progress);
+            step = std::max(step, 1.5f / static_cast<float>(sr * windowSeconds * effectiveCurve[0].x));
+        }
+        if (triggered && effectiveCurve[0].x == 0.0f)
+            smoothedReduction = targetReduction;
+        else
+            smoothedReduction += juce::jlimit(-step, step, targetReduction - smoothedReduction);
+        const float reduction = smoothedReduction;
         const float duck = 1.0f - reduction;
-        blockGainReduction = std::max(blockGainReduction, reduction);
+        blockGainReduction = std::max(blockGainReduction, reduction * sampleMix);
 
-        float bassInMono = 0.0f;
-        float bassOutMono = 0.0f;
+        double inputPower = 0.0, outputPower = 0.0;
+        float displayBassIn = 0.0f, displayBassOut = 0.0f;
 
         if (bassChannels == 1)
         {
             const float dry = bassBuffer.getSample(0, sample) * inputGain;
-            const float output = dry * ((1.0f - mix) + duck * mix) * outputGain;
+            const float output = dry * ((1.0f - sampleMix) + duck * sampleMix) * outputGain;
             bassBuffer.setSample(0, sample, output);
-            bassInMono = dry;
-            bassOutMono = output;
+            inputPower = static_cast<double>(dry) * dry;
+            outputPower = static_cast<double>(output) * output;
+            displayBassIn = dry;
+            displayBassOut = output;
         }
         else
         {
             const float dryL = bassBuffer.getSample(0, sample) * inputGain;
             const float dryR = bassBuffer.getSample(1, sample) * inputGain;
-            const float wetGain = (1.0f - mix) + duck * mix;
+            const float wetGain = (1.0f - sampleMix) + duck * sampleMix;
             const float outputL = dryL * wetGain * outputGain;
             const float outputR = dryR * wetGain * outputGain;
             bassBuffer.setSample(0, sample, outputL);
             bassBuffer.setSample(1, sample, outputR);
-            bassInMono = 0.5f * (dryL + dryR);
-            bassOutMono = 0.5f * (outputL + outputR);
+            inputPower = (static_cast<double>(dryL) * dryL + static_cast<double>(dryR) * dryR) * 0.5;
+            outputPower = (static_cast<double>(outputL) * outputL + static_cast<double>(outputR) * outputR) * 0.5;
+            const bool useLeft = std::abs(dryL) >= std::abs(dryR);
+            displayBassIn = useLeft ? dryL : dryR;
+            displayBassOut = useLeft ? outputL : outputR;
         }
 
-        blockInputPeak = std::max(blockInputPeak, std::abs(bassInMono));
-        blockOutputPeak = std::max(blockOutputPeak, std::abs(bassOutMono));
-        blockBassPeak = std::max(blockBassPeak, std::abs(bassInMono));
-        inputSumSquares += static_cast<double>(bassInMono) * bassInMono;
-        outputSumSquares += static_cast<double>(bassOutMono) * bassOutMono;
+        inputMeter.push(std::abs(displayBassIn), inputPower);
+        outputMeter.push(std::abs(displayBassOut), outputPower);
+        const double actualReduction = reduction * sampleMix;
+        displayedReduction = actualReduction >= displayedReduction ? actualReduction
+            : actualReduction + reductionMeterDecay * (displayedReduction - actualReduction);
 
         // Fixed-capacity atomic DSP history. No vector, mutex or allocation.
-        waveformHistory.push(bassInMono, bassOutMono, kickSample);
+        // Show the strongest signed AUX channel, preserving antiphase kicks.
+        const float displayKick = kickChannels == 2
+            && std::abs(kickBuffer.getSample(1, sample)) > std::abs(kickBuffer.getSample(0, sample))
+                ? kickBuffer.getSample(1, sample) : (hasKick ? kickBuffer.getSample(0, sample) : 0.0f);
+        waveformHistory.push(displayBassIn, displayBassOut, displayKick, reduction * sampleMix);
+        triggeredWaveform.push(displayBassIn, displayBassOut, displayKick,
+            static_cast<int>(juce::jlimit(1.0, 2147483647.0, std::round(windowSeconds * sr))), windowSeconds);
         currentDuck.store(reduction, std::memory_order_relaxed);
-        currentPhase.store(phase, std::memory_order_relaxed);
+        currentPhase.store(static_cast<float>(phase), std::memory_order_relaxed);
+        if (duckCycleActive)
+        {
+            phase = hasKick ? std::min(1.0, phase + phaseIncrement) : phase + phaseIncrement;
+            if (hasKick && phase >= 1.0) duckCycleActive = false;
+        }
     }
 
-    const float inputRmsLinear = static_cast<float>(std::sqrt(inputSumSquares / numSamples));
-    const float outputRmsLinear = static_cast<float>(std::sqrt(outputSumSquares / numSamples));
-    const float kickRmsLinear = static_cast<float>(std::sqrt(kickSumSquares / numSamples));
-
-    const float inputDbNow = linearToDb(inputRmsLinear);
-    const float outputDbNow = linearToDb(outputRmsLinear);
-
-    inputPeak.store(linearToDb(blockInputPeak), std::memory_order_relaxed);
-    outputPeak.store(linearToDb(blockOutputPeak), std::memory_order_relaxed);
-    kickActivity.store(linearToDb(blockKickPeak), std::memory_order_relaxed);
-    bassActivity.store(linearToDb(blockBassPeak), std::memory_order_relaxed);
+    const float inputDbNow = linearToDb(inputMeter.getRms());
+    const float outputDbNow = linearToDb(outputMeter.getRms());
+    inputPeak.store(linearToDb(inputMeter.getPeak()), std::memory_order_relaxed);
+    outputPeak.store(linearToDb(outputMeter.getPeak()), std::memory_order_relaxed);
+    kickActivity.store(linearToDb(kickMeter.getPeak()), std::memory_order_relaxed);
+    bassActivity.store(linearToDb(inputMeter.getPeak()), std::memory_order_relaxed);
     inputRms.store(inputDbNow, std::memory_order_relaxed);
     outputRms.store(outputDbNow, std::memory_order_relaxed);
-    kickRms.store(linearToDb(kickRmsLinear), std::memory_order_relaxed);
+    kickRms.store(linearToDb(kickMeter.getRms()), std::memory_order_relaxed);
+    // Legacy API aliases only; these values are RMS, not loudness measurements.
     inputLufs.store(juce::jlimit(-60.0f, 0.0f, inputDbNow), std::memory_order_relaxed);
     outputLufs.store(juce::jlimit(-60.0f, 0.0f, outputDbNow), std::memory_order_relaxed);
+    meterGainReductionDb.store(linearToDb(static_cast<float>(1.0 - displayedReduction)), std::memory_order_relaxed);
 
     const float remainingGain = juce::jmax(0.000001f, 1.0f - blockGainReduction);
     const float grDb = juce::jlimit(-60.0f, 0.0f, 20.0f * std::log10(remainingGain));
@@ -362,15 +433,22 @@ float KickDuck1AudioProcessor::getInputLufs() const noexcept { return inputLufs.
 float KickDuck1AudioProcessor::getOutputLufs() const noexcept { return outputLufs.load(std::memory_order_relaxed); }
 float KickDuck1AudioProcessor::getGainReduction() const noexcept { return getGainReductionPercent(); }
 float KickDuck1AudioProcessor::getGainReductionDb() const noexcept { return gainReductionDb.load(std::memory_order_relaxed); }
+float KickDuck1AudioProcessor::getMeterGainReductionDb() const noexcept { return meterGainReductionDb.load(std::memory_order_relaxed); }
 float KickDuck1AudioProcessor::getGainReductionPercent() const noexcept { return gainReduction.load(std::memory_order_relaxed); }
 float KickDuck1AudioProcessor::getCurrentDuck() const noexcept { return currentDuck.load(std::memory_order_relaxed); }
 float KickDuck1AudioProcessor::getCurrentPhase() const noexcept { return currentPhase.load(std::memory_order_relaxed); }
 bool KickDuck1AudioProcessor::isSidechainConnected() const noexcept { return sidechainConnected.load(std::memory_order_relaxed); }
 
 void KickDuck1AudioProcessor::copyWaveformSnapshot(float* bassIn, float* bassOut, float* kick,
-                                                   int points, int samplesToCopy) const noexcept
+                                                   int points, int samplesToCopy, bool includeKick, float* reduction) const noexcept
 {
-    waveformHistory.copyLatest(bassIn, bassOut, kick, points, samplesToCopy);
+    waveformHistory.copyLatest(bassIn, bassOut, kick, points, samplesToCopy, includeKick, reduction);
+}
+
+bool KickDuck1AudioProcessor::copyTriggeredWaveform(float* bassIn, float* bassOut, float* kick,
+                                                    std::uint64_t& version, double& seconds) const noexcept
+{
+    return triggeredWaveform.copy(bassIn, bassOut, kick, version, seconds);
 }
 
 std::vector<DuckingCurve::Point> KickDuck1AudioProcessor::getCurvePoints() const
@@ -380,31 +458,186 @@ std::vector<DuckingCurve::Point> KickDuck1AudioProcessor::getCurvePoints() const
 
 void KickDuck1AudioProcessor::setCurvePoints(const std::vector<DuckingCurve::Point>& points)
 {
-    std::vector<DuckingCurve::Point> safe;
-    safe.reserve(std::min(points.size(), static_cast<std::size_t>(maxCurvePoints)));
-    for (const auto& p : points)
-        if (std::isfinite(p.x) && std::isfinite(p.y))
-            safe.push_back({ juce::jlimit(0.0f, 1.0f, p.x), juce::jlimit(0.0f, 1.0f, p.y) });
+    std::lock_guard<std::mutex> lock(curveUpdateMutex);
+    duckingCurve.setPoints(points);
+    // Publish the exact normalized model, including its boundary points.
+    publishCurve(duckingCurve.getPoints());
+}
 
-    std::sort(safe.begin(), safe.end(), [](const auto& a, const auto& b) { return a.x < b.x; });
-    if (safe.empty()) safe = { {0.0f, 1.0f}, {1.0f, 1.0f} };
+namespace
+{
+void setCurveParameter(juce::AudioProcessorValueTreeState& state, const char* id, float value)
+{
+    auto* p = state.getParameter(id);
+    const float normalized = p->convertTo0to1(value);
+    if (std::abs(p->getValue() - normalized) < 0.000001f) return;
+    p->beginChangeGesture();
+    p->setValueNotifyingHost(normalized);
+    p->endChangeGesture();
+}
+}
 
-    duckingCurve.setPoints(safe);
-    publishCurve(safe);
+void KickDuck1AudioProcessor::editCurvePoints(const std::vector<DuckingCurve::Point>& effectivePoints)
+{
+    // Input is the displayed reduction, including AMOUNT. Preserve all other
+    // visible depths when the deepest point changes the global Amount value.
+    auto normalized = effectivePoints;
+    float depth = 0.0f;
+    for (const auto& p : normalized) depth = std::max(depth, p.y);
+    depth = clamp01(depth);
+    for (auto& p : normalized) p.y = depth > 0.000001f ? p.y / depth : 0.0f;
+    setCurveParameter(apvts, "amount", depth * 100.0f);
+    if (normalized.size() >= 3)
+        setCurveParameter(apvts, "length", normalized[1].x * 2.0f);
+    if (normalized.size() >= 5)
+    {
+        const float ms = static_cast<float>(getCycleSeconds() * 1000.0);
+        setCurveParameter(apvts, "release", normalized[2].x * ms);
+        setCurveParameter(apvts, "attack", (1.0f - normalized[normalized.size() - 2].x) * ms);
+    }
+    if (!normalized.empty())
+    {
+        setCurveParameter(apvts, "onsetAttack", normalized[0].x * static_cast<float>(getCycleSeconds() * 1000.0));
+        normalized[0].x = 0.0f;
+    }
+    setCurvePoints(normalized);
+    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
+}
+
+void KickDuck1AudioProcessor::resetCurve()
+{
+    setCurveParameter(apvts, "amount", 70.0f);
+    applyCurvePreset(DuckingCurve::Preset::classic);
+}
+
+void KickDuck1AudioProcessor::setCurveRounded(bool rounded)
+{
+    curveRounded.store(rounded, std::memory_order_relaxed);
+    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
+}
+
+void KickDuck1AudioProcessor::applyCurvePreset(DuckingCurve::Preset preset)
+{
+    setCurveRounded(true);
+    setCurveParameter(apvts, "onsetAttack", 0.0f);
+    const auto points = DuckingCurve::presetPoints(preset);
+    const float ms = static_cast<float>(getCycleSeconds() * 1000.0);
+    setCurveParameter(apvts, "length", points[1].x * 2.0f);
+    setCurveParameter(apvts, "release", points[2].x * ms);
+    setCurveParameter(apvts, "attack", (1.0f - points[points.size() - 2].x) * ms);
+    setCurvePoints(points);
+    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
+}
+
+bool KickDuck1AudioProcessor::tryCopyCurvePoints(
+    std::vector<DuckingCurve::Point>& points) const
+{
+    return duckingCurve.tryCopyPoints(points);
 }
 
 void KickDuck1AudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
+    state.setProperty("stateVersion", 5, nullptr);
+    state.setProperty("curveRounded", isCurveRounded(), nullptr);
+    for (auto oldCurve = state.getChildWithName("DuckingCurve"); oldCurve.isValid();
+         oldCurve = state.getChildWithName("DuckingCurve"))
+        state.removeChild(oldCurve, nullptr);
+
+    juce::ValueTree curveState("DuckingCurve");
+    for (const auto& point : duckingCurve.getPoints())
+    {
+        juce::ValueTree child("Point");
+        child.setProperty("x", point.x, nullptr);
+        child.setProperty("y", point.y, nullptr);
+        curveState.addChild(child, -1, nullptr);
+    }
+    state.addChild(curveState, -1, nullptr);
     if (auto xml = state.createXml())
         copyXmlToBinary(*xml, destData);
 }
 
 void KickDuck1AudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
-    std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data, sizeInBytes));
-    if (xml != nullptr && xml->hasTagName(apvts.state.getType()))
-        apvts.replaceState(juce::ValueTree::fromXml(*xml));
+    if (data == nullptr || sizeInBytes <= 0)
+        return;
+    const auto xml = std::unique_ptr<juce::XmlElement>(getXmlFromBinary(data, sizeInBytes));
+    if (xml == nullptr || !xml->hasTagName(apvts.state.getType()))
+        return;
+
+    auto state = juce::ValueTree::fromXml(*xml);
+    const auto curveState = state.getChildWithName("DuckingCurve");
+    std::vector<DuckingCurve::Point> points;
+    points.reserve(maxCurvePoints);
+    for (int i = 0; i < curveState.getNumChildren() && points.size() < maxCurvePoints; ++i)
+    {
+        const auto child = curveState.getChild(i);
+        if (child.hasType("Point") && child.hasProperty("x") && child.hasProperty("y"))
+            points.push_back({static_cast<float>(child.getProperty("x")),
+                              static_cast<float>(child.getProperty("y"))});
+    }
+    // Legacy states contain only APVTS parameters; their curve was never saved.
+    if (points.empty())
+        points = DuckingCurve::defaultPoints();
+    const int version = static_cast<int>(state.getProperty("stateVersion", 0));
+    // States before v3 used straight segments. Keep their sound until the user
+    // explicitly selects ROUND, a preset or RESET CURVE.
+    curveRounded.store(static_cast<bool>(state.getProperty("curveRounded", false)),
+                       std::memory_order_relaxed);
+    bool hasOnsetAttack = false;
+    for (const auto& child : state)
+        hasOnsetAttack = hasOnsetAttack || child.getProperty("id").toString() == "onsetAttack";
+    if (!hasOnsetAttack)
+    {
+        juce::ValueTree parameterState("PARAM");
+        parameterState.setProperty("id", "onsetAttack", nullptr);
+        parameterState.setProperty("value", 0.0f, nullptr);
+        state.addChild(parameterState, -1, nullptr);
+    }
+    apvts.replaceState(state);
+    if (version < 2 && points.size() >= 3)
+    {
+        // Preserve custom shapes from old projects. The old factory shape gets
+        // the corrected five-point default, without altering Input/Output/Mix.
+        const auto oldDefault = std::vector<DuckingCurve::Point>{{0.0f, 1.0f}, {0.18f, 1.0f},
+            {0.72f, 0.58f}, {0.93f, 0.12f}, {1.0f, 0.0f}};
+        bool factory = points.size() == oldDefault.size();
+        for (size_t i = 0; factory && i < points.size(); ++i)
+            factory = std::abs(points[i].x - oldDefault[i].x) < 0.00001f
+                   && std::abs(points[i].y - oldDefault[i].y) < 0.00001f;
+        if (factory || !curveState.isValid())
+        {
+            resetCurve();
+            setCurveParameter(apvts, "amount", 100.0f);
+            curveRounded.store(false, std::memory_order_relaxed);
+            return;
+        }
+        setCurveParameter(apvts, "length", points[1].x * 2.0f);
+        if (points.size() >= 5)
+        {
+            const float ms = static_cast<float>(getCycleSeconds() * 1000.0);
+            setCurveParameter(apvts, "release", points[2].x * ms);
+            setCurveParameter(apvts, "attack", (1.0f - points[points.size() - 2].x) * ms);
+        }
+    }
+    if (version >= 2 && version < 5)
+    {
+        // Bake the old clamped positions before adopting neighbour-aware limits.
+        DuckingCurve::applyLegacyControls(points.data(), static_cast<int>(points.size()),
+            apvts.getRawParameterValue("length")->load(),
+            apvts.getRawParameterValue("attack")->load(),
+            apvts.getRawParameterValue("release")->load(), getCycleSeconds(),
+            apvts.getRawParameterValue("onsetAttack")->load());
+        if (points.size() >= 5)
+        {
+            const float ms = static_cast<float>(getCycleSeconds() * 1000.0);
+            setCurveParameter(apvts, "length", points[1].x * 2.0f);
+            setCurveParameter(apvts, "release", points[2].x * ms);
+            setCurveParameter(apvts, "attack", (1.0f - points[points.size() - 2].x) * ms);
+        }
+        if (!points.empty()) points[0].x = 0.0f;
+    }
+    setCurvePoints(points);
 }
 
 juce::AudioProcessorEditor* KickDuck1AudioProcessor::createEditor()

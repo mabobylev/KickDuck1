@@ -8,6 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+option(KICKDUCK_COPY_PLUGIN_AFTER_BUILD "Copy VST3 into the user plugin directory" ON)
+
 include(FetchContent)
 
 FetchContent_Declare(
@@ -35,7 +37,7 @@ juce_add_plugin(KickDuck1
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
 
-    COPY_PLUGIN_AFTER_BUILD TRUE
+    COPY_PLUGIN_AFTER_BUILD ${KICKDUCK_COPY_PLUGIN_AFTER_BUILD}
 )
 
 juce_generate_juce_header(KickDuck1)
@@ -68,3 +70,16 @@ target_link_libraries(KickDuck1 PRIVATE
     juce::juce_dsp
     juce::juce_gui_extra
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(KickDuck1Tests Tests/ProcessorTests.cpp)
+    target_include_directories(KickDuck1Tests PRIVATE
+        Source
+        "$<TARGET_PROPERTY:KickDuck1,INCLUDE_DIRECTORIES>")
+    target_compile_definitions(KickDuck1Tests PRIVATE
+        "$<TARGET_PROPERTY:KickDuck1,COMPILE_DEFINITIONS>")
+    target_link_libraries(KickDuck1Tests PRIVATE KickDuck1)
+    add_test(NAME KickDuck1Processor COMMAND KickDuck1Tests)
+    set_tests_properties(KickDuck1Processor PROPERTIES TIMEOUT 30)
+endif()

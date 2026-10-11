@@ -1,0 +1,63 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 22,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "dev",
+      "displayName": "KickDuck1 — Release / Linux",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTING": "ON",
+        "KICKDUCK_COPY_PLUGIN_AFTER_BUILD": "ON"
+      }
+    },
+    {
+      "name": "offline",
+      "displayName": "KickDuck1 — локальный JUCE",
+      "inherits": "dev",
+      "cacheVariables": {
+        "FETCHCONTENT_SOURCE_DIR_JUCE": "${sourceDir}/build/_deps/juce-src"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "tests",
+      "displayName": "Собрать регрессионные проверки",
+      "configurePreset": "dev",
+      "targets": [
+        "KickDuck1Tests"
+      ],
+      "jobs": 3
+    },
+    {
+      "name": "plugin",
+      "displayName": "Собрать и установить VST3 / собрать Standalone",
+      "configurePreset": "dev",
+      "targets": [
+        "KickDuck1_VST3",
+        "KickDuck1_Standalone"
+      ],
+      "jobs": 3
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "displayName": "Проверить KickDuck1",
+      "configurePreset": "dev",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    }
+  ]
+}

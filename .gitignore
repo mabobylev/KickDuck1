@@ -1,5 +1,6 @@
 # Project temp files
 build/
+build-*/
 *.so
 *.7z
 

@@ -17,20 +17,47 @@ public:
     void resized() override;
 
 private:
-    class CurveEditor : public juce::Component
+    class SignalScope : public juce::Component, public juce::SettableTooltipClient
+    {
+    public:
+        SignalScope();
+        void update(KickDuck1AudioProcessor&);
+        void paint(juce::Graphics&) override;
+        void resized() override;
+    private:
+        void rebuildPaths();
+        std::array<float, TriggeredWaveform::points> input {}, output {}, kick {}, reduction {};
+        static constexpr double historySeconds = 2.0;
+        juce::Path compressionPath, outputShape;
+    };
+
+    class CurvePresetButton : public juce::Button
+    {
+    public:
+        explicit CurvePresetButton(DuckingCurve::Preset preset);
+        const std::vector<DuckingCurve::Point>& getPoints() const noexcept { return points; }
+        void paintButton(juce::Graphics&, bool highlighted, bool down) override;
+    private:
+        std::vector<DuckingCurve::Point> points;
+    };
+
+    class CurveEditor : public juce::Component, public juce::SettableTooltipClient
     {
     public:
         CurveEditor();
 
         void setPoints(const std::vector<DuckingCurve::Point>&);
-        void setWaveformsFromProcessor(KickDuck1AudioProcessor&, int samplesToCopy);
+        void setWaveformsFromProcessor(KickDuck1AudioProcessor&);
         void setAmount(float normalizedAmount);
-        void setLength(float musicalLength);
+        void setControls(float musicalLength, float attackMs, float releaseMs, double cycleSeconds, float onsetMs = 0.0f);
+        bool isDragging() const noexcept { return dragging; }
         void setPhase(float normalizedPhase);
+        void setRounded(bool value) { rounded = value; }
 
         std::function<void(const std::vector<DuckingCurve::Point>&)> onPointsChanged;
 
         void paint(juce::Graphics&) override;
+        void mouseMove(const juce::MouseEvent&) override;
         void mouseDown(const juce::MouseEvent&) override;
         void mouseDrag(const juce::MouseEvent&) override;
         void mouseUp(const juce::MouseEvent&) override;
@@ -56,10 +83,18 @@ private:
         std::array<float, maxWaveformPoints> bassOutWaveform{};
         std::array<float, maxWaveformPoints> kickWaveform{};
 
-        float amount = 0.75f;
+        std::vector<DuckingCurve::Point> storedPoints;
+        float length = 0.5f;
+        float attack = 50.0f, release = 250.0f, onsetAttack = 0.0f;
+        double cycleSeconds = 0.5;
+        void updateEffectivePoints();
+
+        float amount = 1.0f;
         float phase = 0.0f;
+        std::uint64_t waveformVersion = 0;
         int selectedPoint = -1;
         bool dragging = false;
+        bool rounded = true;
     };
 
     void timerCallback() override;
@@ -81,26 +116,38 @@ private:
 
     KickDuck1AudioProcessor& processor;
     CurveEditor curveEditor;
+    SignalScope signalScope;
+    juce::TextButton resetCurveButton {"RESET CURVE"};
+    juce::TextButton legacyMixButton;
+    std::array<std::unique_ptr<CurvePresetButton>, DuckingCurve::presetCount> presetButtons;
+    juce::TooltipWindow tooltipWindow {this, 500};
 
-    juce::Slider amountSlider, lengthSlider, attackSlider, releaseSlider, mixSlider;
+    juce::Slider onsetAttackSlider;
+    juce::Label onsetAttackLabel;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> onsetAttackAttachment;
+    juce::Slider amountSlider, lengthSlider, attackSlider, releaseSlider;
     juce::Slider inputSlider, outputSlider;
-    juce::Label amountLabel, lengthLabel, attackLabel, releaseLabel, mixLabel;
+    juce::Label amountLabel, lengthLabel, attackLabel, releaseLabel;
     juce::Label inputLabel, outputLabel;
 
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> amountAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> lengthAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attackAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> releaseAttachment;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> mixAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> inputAttachment;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> outputAttachment;
 
+    float inputMeterDb = -60.0f, outputMeterDb = -60.0f, grMeterDb = 0.0f;
     juce::String inputPeakText, inputRmsText, inputLufsText;
     juce::String outputPeakText, outputRmsText, outputLufsText;
     juce::String kickPeakText, kickRmsText;
     juce::String grDbText, grPercentText, duckText, sidechainText;
 
-    int waveformFrameCounter = 0;
+    std::vector<DuckingCurve::Point> curveSnapshot;
+    struct Layout
+    {
+        juce::Rectangle<int> graph, meters, presets, shape, gains, amount;
+    } layout;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(KickDuck1AudioProcessorEditor)
 };

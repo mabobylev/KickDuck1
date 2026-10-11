@@ -23,37 +23,6 @@ namespace
         return juce::jlimit(0.0f, 1.0f, (db + 60.0f) / 60.0f);
     }
 
-    std::vector<DuckingCurve::Point> defaultCurve()
-    {
-        // DSP Y is duck depth:
-        // 0 = no reduction, 1 = maximum reduction.
-        //
-        // The GUI displays maximum reduction at the bottom.
-        // The kick starts at maximum duck depth, holds it through
-        // point #2, then the remaining points define bass recovery.
-        return {
-            { 0.00f, 1.00f },
-            { 0.18f, 1.00f },
-            { 0.72f, 0.58f },
-            { 0.93f, 0.12f },
-            { 1.00f, 0.00f }
-        };
-    }
-
-    bool isUnityCurve(const std::vector<DuckingCurve::Point>& p)
-    {
-        if (p.size() < 2)
-            return true;
-
-        for (const auto& point : p)
-        {
-            if (std::abs(point.y - 1.0f) > 0.0001f)
-                return false;
-        }
-
-        return true;
-    }
-
     void cacheNumber(juce::String& dst, float value, const char* suffix)
     {
         char buf[48]{};
@@ -65,6 +34,128 @@ namespace
 
         dst = buf;
     }
+}
+
+KickDuck1AudioProcessorEditor::CurvePresetButton::CurvePresetButton(DuckingCurve::Preset preset)
+    : juce::Button(juce::String("Curve preset: ") + DuckingCurve::presetName(preset)),
+      points(DuckingCurve::presetPoints(preset))
+{
+    setName(getButtonText());
+    setTooltip(juce::String(DuckingCurve::presetName(preset)) + " curve (keeps Amount and signal levels)");
+}
+
+void KickDuck1AudioProcessorEditor::CurvePresetButton::paintButton(
+    juce::Graphics& g, bool highlighted, bool down)
+{
+    const bool selected = getToggleState();
+    const auto box = getLocalBounds().toFloat().reduced(0.5f);
+    g.setColour(selected ? curveColour.withAlpha(0.18f) : (highlighted || down ? panel3 : panel2));
+    g.fillRoundedRectangle(box, 5.0f);
+    g.setColour(selected ? curveColour : gridBright);
+    g.drawRoundedRectangle(box, 5.0f, 1.0f);
+    const auto graph = box.reduced(6.0f, 5.0f).withTrimmedBottom(13.0f);
+    g.setColour(selected || highlighted ? curveColour : muted);
+    juce::Point<float> previous {graph.getX(), graph.getY() + points.front().y * graph.getHeight()};
+    constexpr int steps = 40;
+    for (int i = 1; i <= steps; ++i)
+    {
+        const float x = static_cast<float>(i) / steps;
+        const juce::Point<float> next {graph.getX() + x * graph.getWidth(),
+            graph.getY() + DuckingCurve::sample(points.data(), static_cast<int>(points.size()), x, true) * graph.getHeight()};
+        g.drawLine({previous, next}, 1.6f);
+        previous = next;
+    }
+    g.setColour(selected ? curveColour : ::text);
+    g.setFont(font(12.0f, true));
+    g.drawText(getButtonText().fromFirstOccurrenceOf(": ", false, false),
+               getLocalBounds().withTop(getHeight() - 15), juce::Justification::centred);
+
+}
+
+KickDuck1AudioProcessorEditor::SignalScope::SignalScope()
+{
+    setName("Signal scope");
+    setTooltip("Scrolling history (2 seconds): muted filled half-wave is Bass Output. Light GR line above shows actual gain reduction including Amount and Mix; deeper means stronger ducking. Input/Output gain does not affect GR.");
+}
+
+void KickDuck1AudioProcessorEditor::SignalScope::update(KickDuck1AudioProcessor& processor)
+{
+    const int samples = static_cast<int>(juce::jlimit(1.0, 2147483647.0,
+        std::round(processor.getSampleRate() * historySeconds)));
+    processor.copyWaveformSnapshot(input.data(), output.data(), kick.data(),
+                                   static_cast<int>(input.size()), samples, false, reduction.data());
+    rebuildPaths();
+    repaint();
+}
+
+void KickDuck1AudioProcessorEditor::SignalScope::resized()
+{
+    rebuildPaths();
+}
+
+void KickDuck1AudioProcessorEditor::SignalScope::rebuildPaths()
+{
+    compressionPath.clear();
+    outputShape.clear();
+    const auto graph = getLocalBounds().toFloat().reduced(10.0f, 5.0f).withTrimmedTop(13.0f);
+    const int columns = std::min(TriggeredWaveform::points, static_cast<int>(graph.getWidth()));
+    if (columns < 2 || graph.getHeight() <= 0.0f) return;
+    float peak = 0.08f;
+    for (int i = 0; i < TriggeredWaveform::points; ++i)
+    {
+        if (std::isfinite(input[i])) peak = std::max(peak, std::abs(input[i]));
+        if (std::isfinite(output[i])) peak = std::max(peak, std::abs(output[i]));
+    }
+    const float grTop = graph.getY() + 1.0f;
+    const float grHeight = graph.getHeight() * 0.28f;
+    const float waveHeight = graph.getHeight() * 0.55f;
+    outputShape.startNewSubPath(graph.getX(), graph.getBottom());
+    for (int column = 0; column < columns; ++column)
+    {
+        const int first = column * TriggeredWaveform::points / columns;
+        const int last = (column + 1) * TriggeredWaveform::points / columns;
+        float amplitude = 0.0f, gainReduction = 0.0f;
+        for (int i = first; i < last; ++i)
+        {
+            if (std::isfinite(output[i])) amplitude = std::max(amplitude, std::abs(output[i]));
+            if (std::isfinite(reduction[i])) gainReduction = std::max(gainReduction, reduction[i]);
+        }
+        const float x = graph.getX() + column * graph.getWidth() / (columns - 1);
+        outputShape.lineTo(x, graph.getBottom() - amplitude / peak * waveHeight);
+        const float grY = grTop + juce::jlimit(0.0f, 1.0f, gainReduction) * grHeight;
+        if (column == 0) compressionPath.startNewSubPath(x, grY);
+        else compressionPath.lineTo(x, grY);
+    }
+    outputShape.lineTo(graph.getRight(), graph.getBottom());
+    outputShape.closeSubPath();
+}
+
+void KickDuck1AudioProcessorEditor::SignalScope::paint(juce::Graphics& g)
+{
+    const auto box = getLocalBounds().toFloat().reduced(0.5f);
+    g.setColour(panel2);
+    g.fillRoundedRectangle(box, 7.0f);
+    g.setColour(grid);
+    g.drawRoundedRectangle(box, 7.0f, 1.0f);
+    g.setFont(font(10.0f, true));
+    g.setColour(muted);
+    g.drawText("SIGNAL", 10, 3, 52, 13, juce::Justification::left);
+    g.setColour(juce::Colour::fromRGB(92, 150, 128));
+    g.drawText("OUT", 68, 3, 30, 13, juce::Justification::left);
+    g.setColour(juce::Colour::fromRGB(211, 220, 232));
+    g.drawText("GR", 108, 3, 30, 13, juce::Justification::left);
+    g.setColour(muted);
+    g.drawText("LIVE 2 s",
+               getWidth() - 82, 3, 72, 13, juce::Justification::right);
+    const auto graph = getLocalBounds().toFloat().reduced(10.0f, 5.0f).withTrimmedTop(13.0f);
+    g.setColour(grid);
+    g.drawLine(graph.getX(), graph.getBottom(), graph.getRight(), graph.getBottom());
+    g.setColour(juce::Colour::fromRGB(68, 121, 104).withAlpha(0.65f));
+    g.fillPath(outputShape);
+    g.setColour(juce::Colour::fromRGB(92, 150, 128).withAlpha(0.6f));
+    g.strokePath(outputShape, juce::PathStrokeType(0.7f));
+    g.setColour(juce::Colour::fromRGB(211, 220, 232));
+    g.strokePath(compressionPath, juce::PathStrokeType(1.2f));
 }
 
 juce::Font KickDuck1AudioProcessorEditor::font(float size, bool bold)
@@ -84,41 +175,38 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
     setResizable(true, true);
     setResizeLimits(1050, 680, 1800, 1100);
 
-    auto curve = processor.getCurvePoints();
-    bool needsDefaultCurve = isUnityCurve(curve);
-
-    if (!needsDefaultCurve && curve.size() == 5)
-    {
-        // Migrate the previous UI6 default, whose first point was no-duck.
-        needsDefaultCurve =
-            std::abs(curve[0].x - 0.00f) < 0.01f
-            && std::abs(curve[0].y - 0.00f) < 0.01f
-            && std::abs(curve[1].x - 0.18f) < 0.02f
-            && std::abs(curve[1].y - 0.14f) < 0.03f
-            && std::abs(curve[2].x - 0.72f) < 0.02f;
-    }
-
-    if (needsDefaultCurve)
-    {
-        curve = defaultCurve();
-        processor.setCurvePoints(curve);
-    }
-
-    curveEditor.setPoints(curve);
+    curveEditor.setPoints(processor.getCurvePoints());
 
     curveEditor.onPointsChanged =
         [this](const std::vector<DuckingCurve::Point>& points)
         {
-            processor.setCurvePoints(points);
+            processor.editCurvePoints(points);
+            curveEditor.setAmount(processor.apvts.getRawParameterValue("amount")->load() * 0.01f);
+            curveEditor.setControls(processor.apvts.getRawParameterValue("length")->load(),
+                                    processor.apvts.getRawParameterValue("attack")->load(),
+                                    processor.apvts.getRawParameterValue("release")->load(),
+                                    processor.getCycleSeconds(), processor.apvts.getRawParameterValue("onsetAttack")->load());
+            curveEditor.setPoints(processor.getCurvePoints());
         };
 
+    curveEditor.setName("Ducking curve");
     addAndMakeVisible(curveEditor);
+    addAndMakeVisible(signalScope);
+    resetCurveButton.onClick = [this]
+    {
+        processor.resetCurve();
+        updateMeters();
+        curveEditor.setPoints(processor.getCurvePoints());
+    };
+    addAndMakeVisible(resetCurveButton);
 
+    setupKnob(onsetAttackSlider, onsetAttackLabel, "ATTACK");
+    onsetAttackAttachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(processor.apvts, "onsetAttack", onsetAttackSlider);
+    onsetAttackSlider.setTooltip("Time to reach the first point's reduction. Drag the first point horizontally to adjust Attack.");
     setupKnob(amountSlider, amountLabel, "AMOUNT");
     setupKnob(lengthSlider, lengthLabel, "LENGTH");
-    setupKnob(attackSlider, attackLabel, "ATTACK");
-    setupKnob(releaseSlider, releaseLabel, "RELEASE");
-    setupKnob(mixSlider, mixLabel, "MIX");
+    setupKnob(attackSlider, attackLabel, "TAIL");
+    setupKnob(releaseSlider, releaseLabel, "RECOVER");
     setupKnob(inputSlider, inputLabel, "INPUT");
     setupKnob(outputSlider, outputLabel, "OUTPUT");
 
@@ -141,11 +229,6 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
         std::make_unique<
             juce::AudioProcessorValueTreeState::SliderAttachment>(
             processor.apvts, "release", releaseSlider);
-
-    mixAttachment =
-        std::make_unique<
-            juce::AudioProcessorValueTreeState::SliderAttachment>(
-            processor.apvts, "mix", mixSlider);
 
     inputAttachment =
         std::make_unique<
@@ -174,7 +257,47 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
         s->preallocateBytes(64);
     }
 
-    startTimerHz(24);
+    inputSlider.setColour(juce::Slider::rotarySliderFillColourId, kickColour);
+    inputSlider.setColour(juce::Slider::thumbColourId, kickColour);
+    outputSlider.setColour(juce::Slider::rotarySliderFillColourId, bassOutColour);
+    outputSlider.setColour(juce::Slider::thumbColourId, bassOutColour);
+    amountLabel.setColour(juce::Label::textColourId, curveColour);
+    amountLabel.setFont(font(13.0f, true));
+    amountSlider.setTooltip("Main ducking depth. Legacy Mix remains available in the host.");
+    legacyMixButton.setName("Legacy Mix");
+    legacyMixButton.setTooltip("This project uses the legacy Mix parameter. Click to restore Mix to 100%.");
+    legacyMixButton.onClick = [this]
+    {
+        auto* mix = processor.apvts.getParameter("mix");
+        mix->beginChangeGesture();
+        mix->setValueNotifyingHost(mix->convertTo0to1(100.0f));
+        mix->endChangeGesture();
+        updateMeters();
+    };
+    addChildComponent(legacyMixButton);
+    lengthSlider.setTooltip("Position of point 2: Length / 2 of one beat. Does not delay the trigger.");
+    releaseSlider.setTooltip("Time from the kick trigger to point 3 (recovery target). Not a compressor release constant.");
+    attackSlider.setTooltip("Duration from the penultimate point to the end of the cycle. Not compressor attack or pre-delay.");
+    for (int i = 0; i < DuckingCurve::presetCount; ++i)
+    {
+        const auto preset = static_cast<DuckingCurve::Preset>(i);
+        auto& button = presetButtons[i];
+        button = std::make_unique<CurvePresetButton>(preset);
+        button->onClick = [this, preset]
+        {
+            processor.applyCurvePreset(preset);
+            processor.tryCopyCurvePoints(curveSnapshot);
+            curveEditor.setPoints(curveSnapshot);
+            updateMeters();
+        };
+        addAndMakeVisible(*button);
+    }
+    resized();
+    curveSnapshot.reserve(DuckingCurve::maxPoints);
+    processor.tryCopyCurvePoints(curveSnapshot);
+    updateMeters();
+    updateWaveform();
+    startTimerHz(30);
 }
 
 KickDuck1AudioProcessorEditor::~KickDuck1AudioProcessorEditor()
@@ -187,6 +310,7 @@ void KickDuck1AudioProcessorEditor::setupKnob(
     juce::Label& label,
     const juce::String& name)
 {
+    slider.setName(name);
     slider.setSliderStyle(
         juce::Slider::RotaryHorizontalVerticalDrag);
 
@@ -195,6 +319,7 @@ void KickDuck1AudioProcessorEditor::setupKnob(
 
     slider.setColour(
         juce::Slider::rotarySliderFillColourId, curveColour);
+    slider.setColour(juce::Slider::thumbColourId, curveColour);
 
     slider.setColour(
         juce::Slider::rotarySliderOutlineColourId, gridBright);
@@ -211,7 +336,7 @@ void KickDuck1AudioProcessorEditor::setupKnob(
     addAndMakeVisible(slider);
 
     label.setText(name, juce::dontSendNotification);
-    label.setFont(font(10.0f, true));
+    label.setFont(font(12.0f, true));
     label.setColour(juce::Label::textColourId, muted);
     label.setJustificationType(juce::Justification::centred);
 
@@ -221,7 +346,7 @@ void KickDuck1AudioProcessorEditor::setupKnob(
 juce::String KickDuck1AudioProcessorEditor::formatDb(float value)
 {
     if (!std::isfinite(value) || value <= -59.9f)
-        return "-∞ dB";
+        return "-inf dB";
 
     return juce::String(value, 1) + " dB";
 }
@@ -297,7 +422,7 @@ void KickDuck1AudioProcessorEditor::paint(juce::Graphics& g)
     g.setColour(connected ? text : muted);
     g.setFont(font(10.5f, true));
     g.drawText(
-        connected ? "KICK AUX  •  ONLINE" : "KICK AUX  •  WAITING",
+        connected ? "KICK AUX  |  ONLINE" : "KICK AUX OFF  |  BPM",
         sx + 15.0f, 23.0f, 170.0f, 20.0f,
         juce::Justification::left);
 
@@ -305,15 +430,8 @@ void KickDuck1AudioProcessorEditor::paint(juce::Graphics& g)
     g.drawHorizontalLine(
         70, 26.0f, static_cast<float>(getWidth()) - 26.0f);
 
-    auto content =
-        getLocalBounds()
-            .withTrimmedTop(82)
-            .withTrimmedBottom(154)
-            .reduced(18, 0)
-            .toFloat();
-
-    auto meters = content.removeFromRight(290.0f);
-    auto graph = content;
+    const auto meters = layout.meters.toFloat();
+    const auto graph = layout.graph.toFloat();
 
     g.setColour(panel2);
     g.fillRoundedRectangle(graph, 12.0f);
@@ -330,7 +448,7 @@ void KickDuck1AudioProcessorEditor::paint(juce::Graphics& g)
     g.setColour(muted);
     g.setFont(font(9.5f, true));
     g.drawText(
-        "KICK + BASS OUT  /  SNAPSHOT HISTORY",
+        "KICK + BASS OUT  /  TRIGGERED FRAME",
         graph.getX() + 15.0f,
         graph.getY() + 10.0f,
         300.0f, 18.0f,
@@ -352,149 +470,115 @@ void KickDuck1AudioProcessorEditor::paint(juce::Graphics& g)
         100.0f, 18.0f,
         juce::Justification::left);
 
-    // Keep the three meters compact and high in the panel.
-    // Order: INPUT | GR | OUTPUT.
-    auto m =
-        meters.withTrimmedTop(38.0f)
-            .withHeight(290.0f)
-            .reduced(12.0f, 0.0f);
-
+    // Meter area and footer share the panel's geometry at every window size.
+    auto m = meters.withTrimmedTop(36.0f).withTrimmedBottom(120.0f).reduced(12.0f, 0.0f);
     const float gap = 8.0f;
     const float w = (m.getWidth() - gap * 2.0f) / 3.0f;
-
     auto inputMeter = m.removeFromLeft(w);
     m.removeFromLeft(gap);
-
     auto grMeter = m.removeFromLeft(w);
     m.removeFromLeft(gap);
-
     auto outputMeter = m;
 
     drawMeter(
         g, inputMeter,
-        processor.getInputPeak(),
+        inputMeterDb,
         "INPUT", inputPeakText, false);
 
     drawMeter(
         g, grMeter,
-        processor.getGainReductionDb(),
+        grMeterDb,
         "GR", grDbText, true);
 
     drawMeter(
         g, outputMeter,
-        processor.getOutputPeak(),
+        outputMeterDb,
         "OUTPUT", outputPeakText, false);
 
-    auto readouts = meters.reduced(12.0f, 0.0f);
-    readouts = readouts.withTop(readouts.getBottom() - 102.0f);
+    auto footer = meters.withTop(meters.getBottom() - 110.0f).reduced(12.0f, 0.0f);
+    auto rmsRow = footer.removeFromTop(38.0f);
+    const float rw = (rmsRow.getWidth() - 8.0f) * 0.5f;
+    auto inRead = rmsRow.removeFromLeft(rw);
+    rmsRow.removeFromLeft(8.0f);
+    drawReadout(g, inRead, "INPUT RMS", inputRmsText, {}, kickColour);
+    drawReadout(g, rmsRow, "OUTPUT RMS", outputRmsText, {}, bassOutColour);
 
-    const float rw = (readouts.getWidth() - 8.0f) * 0.5f;
+    const auto footerText = [&g, &footer](const juce::String& value, juce::Colour colour)
+    {
+        g.setColour(colour);
+        g.setFont(font(11.0f, true));
+        g.drawText(value, footer.removeFromTop(21.0f), juce::Justification::centred);
+    };
+    footerText("KICK  " + kickPeakText + "  /  " + kickRmsText, kickColour);
+    footerText(duckText, curveColour);
+    footerText(sidechainText, connected ? bassOutColour : muted);
 
-    auto inRead = readouts.removeFromLeft(rw);
-    readouts.removeFromLeft(8.0f);
-
-    auto outRead = readouts;
-
-    drawReadout(
-        g, inRead, "INPUT",
-        inputRmsText, inputLufsText, kickColour);
-
-    drawReadout(
-        g, outRead, "OUTPUT",
-        outputRmsText, outputLufsText, bassOutColour);
-
-    g.setColour(kickColour);
-    g.setFont(font(9.5f, true));
-    g.drawText(
-        "KICK  " + kickPeakText + "  /  " + kickRmsText,
-        meters.getX() + 12.0f,
-        meters.getBottom() - 88.0f,
-        meters.getWidth() - 24.0f,
-        18.0f,
-        juce::Justification::centred);
-
-    g.setColour(curveColour);
-    g.drawText(
-        duckText,
-        meters.getX() + 12.0f,
-        meters.getBottom() - 64.0f,
-        meters.getWidth() - 24.0f,
-        18.0f,
-        juce::Justification::centred);
-
-    g.setColour(connected ? bassOutColour : muted);
-    g.drawText(
-        sidechainText,
-        meters.getX() + 12.0f,
-        meters.getBottom() - 39.0f,
-        meters.getWidth() - 24.0f,
-        18.0f,
-        juce::Justification::centred);
-
-    auto controls =
-        getLocalBounds()
-            .removeFromBottom(140)
-            .reduced(22, 7)
-            .toFloat();
-
-    g.setColour(panel2);
-    g.fillRoundedRectangle(controls, 12.0f);
-
-    g.setColour(grid);
-    g.drawRoundedRectangle(controls, 12.0f, 1.0f);
-
-    g.setColour(muted);
-    g.setFont(font(9.5f, true));
-    g.drawText(
-        "DUCKING CONTROLS",
-        controls.getX() + 14.0f,
-        controls.getY() + 8.0f,
-        150.0f, 16.0f,
-        juce::Justification::left);
+    const auto controlPanel = [&g](juce::Rectangle<int> bounds, const char* title, juce::Colour accent)
+    {
+        const auto area = bounds.toFloat();
+        g.setColour(panel2);
+        g.fillRoundedRectangle(area, 12.0f);
+        g.setColour(accent.withAlpha(0.35f));
+        g.drawRoundedRectangle(area.reduced(0.5f), 12.0f, 1.0f);
+        g.setColour(accent);
+        g.setFont(font(11.0f, true));
+        g.drawText(title, bounds.withHeight(26).reduced(14, 0), juce::Justification::left);
+    };
+    controlPanel(layout.presets, "CURVE PRESETS", curveColour);
+    controlPanel(layout.shape, "CURVE TIMING", muted);
+    controlPanel(layout.gains, "SIGNAL LEVELS", bassOutColour);
+    controlPanel(layout.amount, "DUCKING DEPTH", curveColour);
 }
 
 void KickDuck1AudioProcessorEditor::resized()
 {
-    auto content =
-        getLocalBounds()
-            .withTrimmedTop(82)
-            .withTrimmedBottom(154)
-            .reduced(18, 0);
+    resetCurveButton.setBounds(getWidth() - 120, 24, 98, 25);
+    signalScope.setBounds(300, 14, getWidth() - 610, 50);
+    auto content = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(190).reduced(18, 0);
+    layout.meters = content.removeFromRight(320);
+    content.removeFromRight(10);
+    layout.graph = content;
+    curveEditor.setBounds(layout.graph);
 
-    auto meters = content.removeFromRight(290);
-    curveEditor.setBounds(content);
+    auto controls = getLocalBounds().removeFromBottom(176).reduced(18, 7);
+    layout.amount = controls.removeFromRight(180);
+    controls.removeFromRight(8);
+    layout.gains = controls.removeFromRight(200);
+    controls.removeFromRight(8);
+    layout.presets = controls.removeFromLeft(270);
+    controls.removeFromLeft(8);
+    layout.shape = controls;
 
-    auto controls =
-        getLocalBounds()
-            .removeFromBottom(140)
-            .reduced(22, 7);
-
-    controls.removeFromTop(25);
-
-    const int gap = 8;
-    const int cellW = (controls.getWidth() - gap * 6) / 7;
-
-    auto place =
-        [&controls, cellW, gap](
-            juce::Slider& slider,
-            juce::Label& label)
-        {
-            auto cell = controls.removeFromLeft(cellW);
-            controls.removeFromLeft(gap);
-
-            label.setBounds(cell.removeFromTop(18));
-            slider.setBounds(cell.reduced(4, 0));
-        };
-
-    place(amountSlider, amountLabel);
-    place(lengthSlider, lengthLabel);
-    place(attackSlider, attackLabel);
-    place(releaseSlider, releaseLabel);
-    place(mixSlider, mixLabel);
-    place(inputSlider, inputLabel);
-    place(outputSlider, outputLabel);
-
-    juce::ignoreUnused(meters);
+    const auto place = [](juce::Rectangle<int> cell, juce::Slider& slider, juce::Label& label)
+    {
+        label.setBounds(cell.removeFromTop(20));
+        slider.setBounds(cell.reduced(2, 0));
+    };
+    auto shape = layout.shape.withTrimmedTop(28).reduced(4, 0);
+    // Keep timing controls close together even in a wide editor.
+    const int cellWidth = std::min(110, shape.getWidth() / 4);
+    shape.removeFromLeft((shape.getWidth() - cellWidth * 4) / 2);
+    place(shape.removeFromLeft(cellWidth), onsetAttackSlider, onsetAttackLabel);
+    place(shape.removeFromLeft(cellWidth), lengthSlider, lengthLabel);
+    place(shape.removeFromLeft(cellWidth), releaseSlider, releaseLabel);
+    place(shape.removeFromLeft(cellWidth), attackSlider, attackLabel);
+    auto gains = layout.gains.withTrimmedTop(28).reduced(10, 0);
+    place(gains.removeFromLeft(gains.getWidth() / 2), inputSlider, inputLabel);
+    place(gains, outputSlider, outputLabel);
+    for (auto* slider : {&onsetAttackSlider, &lengthSlider, &attackSlider, &releaseSlider, &inputSlider, &outputSlider})
+        slider->setBounds(slider->getBounds().withHeight(82));
+    auto amount = layout.amount.withTrimmedTop(24).reduced(10, 0);
+    legacyMixButton.setBounds(amount.removeFromBottom(22).reduced(4, 1));
+    place(amount, amountSlider, amountLabel);
+    auto presets = layout.presets.withTrimmedTop(32).reduced(10, 0);
+    const int gap = 6;
+    const int width = (presets.getWidth() - gap * 2) / 3;
+    for (int i = 0; i < DuckingCurve::presetCount; ++i)
+    {
+        if (presetButtons[i])
+            presetButtons[i]->setBounds(presets.getX() + (i % 3) * (width + gap),
+                                        presets.getY() + (i / 3) * 58, width, 50);
+    }
 }
 
 void KickDuck1AudioProcessorEditor::drawMeter(
@@ -513,7 +597,7 @@ void KickDuck1AudioProcessorEditor::drawMeter(
         area.reduced(0.5f), 8.0f, 1.0f);
 
     g.setColour(muted);
-    g.setFont(font(8.5f, true));
+    g.setFont(font(12.0f, true));
     g.drawText(
         title,
         area.getX(),
@@ -524,7 +608,7 @@ void KickDuck1AudioProcessorEditor::drawMeter(
 
     // Reserve space on the right for readable scale labels.
     auto bar = area.reduced(8.0f, 29.0f);
-    bar.removeFromRight(20.0f);
+    bar.removeFromRight(27.0f);
     bar.removeFromBottom(34.0f);
 
     g.setColour(juce::Colour::fromRGB(8, 11, 15));
@@ -551,9 +635,8 @@ void KickDuck1AudioProcessorEditor::drawMeter(
         g.setColour(
             gainReduction
                 ? grColour
-                : (safeLevelDb > -6.0f
-                       ? kickColour
-                       : bassOutColour));
+                : (safeLevelDb >= 0.0f ? grColour
+                   : (safeLevelDb > -6.0f ? kickColour : bassOutColour)));
 
         g.fillRoundedRectangle(fill, 4.0f);
     }
@@ -562,7 +645,7 @@ void KickDuck1AudioProcessorEditor::drawMeter(
     g.drawRoundedRectangle(bar, 4.0f, 1.0f);
 
     g.setColour(muted);
-    g.setFont(font(7.0f));
+    g.setFont(font(11.0f));
 
     if (gainReduction)
     {
@@ -580,9 +663,9 @@ void KickDuck1AudioProcessorEditor::drawMeter(
             g.drawText(
                 juce::String(gr),
                 bar.getRight() + 3.0f,
-                y - 5.0f,
-                22.0f,
-                11.0f,
+                y - 7.0f,
+                28.0f,
+                15.0f,
                 juce::Justification::left);
         }
     }
@@ -599,15 +682,15 @@ void KickDuck1AudioProcessorEditor::drawMeter(
             g.drawText(
                 juce::String(db),
                 bar.getRight() + 3.0f,
-                y - 5.0f,
-                22.0f,
-                11.0f,
+                y - 7.0f,
+                28.0f,
+                15.0f,
                 juce::Justification::left);
         }
     }
 
     g.setColour(text);
-    g.setFont(font(10.0f, true));
+    g.setFont(font(13.0f, true));
     g.drawText(
         value,
         area.getX(),
@@ -626,7 +709,7 @@ void KickDuck1AudioProcessorEditor::drawReadout(
     juce::Colour accent) const
 {
     g.setColour(muted);
-    g.setFont(font(8.0f, true));
+    g.setFont(font(11.0f, true));
     g.drawText(
         title,
         area.getX(),
@@ -658,6 +741,9 @@ void KickDuck1AudioProcessorEditor::drawReadout(
 
 void KickDuck1AudioProcessorEditor::timerCallback()
 {
+    // Reuse capacity: state restoration is reflected without allocating here.
+    if (!curveEditor.isDragging() && processor.tryCopyCurvePoints(curveSnapshot))
+        curveEditor.setPoints(curveSnapshot);
     updateMeters();
     updateWaveform();
     repaint();
@@ -665,6 +751,51 @@ void KickDuck1AudioProcessorEditor::timerCallback()
 
 void KickDuck1AudioProcessorEditor::updateMeters()
 {
+    const bool rounded = processor.isCurveRounded();
+    curveEditor.setRounded(rounded);
+    std::array<DuckingCurve::Point, DuckingCurve::maxPoints> effective {};
+    const int count = static_cast<int>(curveSnapshot.size());
+    std::copy(curveSnapshot.begin(), curveSnapshot.end(), effective.begin());
+    DuckingCurve::applyControls(effective.data(), count,
+        processor.apvts.getRawParameterValue("length")->load(),
+        processor.apvts.getRawParameterValue("attack")->load(),
+        processor.apvts.getRawParameterValue("release")->load(), processor.getCycleSeconds(), processor.apvts.getRawParameterValue("onsetAttack")->load());
+    // Restrict manual controls to the geometry actually available at this BPM.
+    // setRange/setValue without notifications never rewrite saved automation.
+    const auto limitKnob = [](juce::Slider& slider, double low, double high,
+                              double actual, double interval)
+    {
+        high = std::max(low + interval, high);
+        slider.setRange(low, high, interval);
+        slider.setValue(actual, juce::dontSendNotification);
+    };
+    const double ms = processor.getCycleSeconds() * 1000.0;
+    if (count >= 2)
+        limitKnob(onsetAttackSlider, 0.0, std::min(100.0, std::max(0.0, (effective[1].x - 0.002) * ms)),
+                  effective[0].x * ms, 0.01);
+    if (count >= 5)
+    {
+        const double recoverLow = std::max(10.0, (effective[1].x + 0.002) * ms);
+        const double recoverHigh = std::min(4000.0, (effective[3].x - 0.002) * ms);
+        limitKnob(releaseSlider, recoverLow, recoverHigh, effective[2].x * ms, 0.1);
+        const int tail = count - 2;
+        const double tailLow = std::max(0.0, (1.0 - curveSnapshot[tail + 1].x + 0.002) * ms);
+        const double tailHigh = std::min(1000.0, (1.0 - effective[tail - 1].x - 0.002) * ms);
+        limitKnob(attackSlider, tailLow, tailHigh, (1.0 - effective[tail].x) * ms, 0.01);
+    }
+    for (auto& button : presetButtons)
+    {
+        if (!button) continue;
+        const auto& preset = button->getPoints();
+        bool matches = rounded && count == static_cast<int>(preset.size());
+        for (int i = 0; matches && i < count; ++i)
+            matches = std::abs(effective[i].x - preset[i].x) < 0.0005f
+                && std::abs(effective[i].y - preset[i].y) < 0.0005f;
+        button->setToggleState(matches, juce::dontSendNotification);
+    }
+    const float legacyMix = processor.apvts.getRawParameterValue("mix")->load();
+    legacyMixButton.setVisible(std::abs(legacyMix - 100.0f) > 0.01f);
+    legacyMixButton.setButtonText("MIX " + juce::String(legacyMix, 0) + "%  -> 100%");
     const auto* amountParam =
         processor.apvts.getRawParameterValue("amount");
 
@@ -683,11 +814,17 @@ void KickDuck1AudioProcessorEditor::updateMeters()
             ? lengthParam->load(std::memory_order_relaxed)
             : 0.5f;
 
-    curveEditor.setLength(length);
+    curveEditor.setControls(length,
+        processor.apvts.getRawParameterValue("attack")->load(),
+        processor.apvts.getRawParameterValue("release")->load(),
+        processor.getCycleSeconds(), processor.apvts.getRawParameterValue("onsetAttack")->load());
     curveEditor.setPhase(processor.getCurrentPhase());
 
+    inputMeterDb = processor.getInputPeak();
+    outputMeterDb = processor.getOutputPeak();
+    grMeterDb = processor.getMeterGainReductionDb();
     cacheNumber(
-        inputPeakText, processor.getInputPeak(), " dB");
+        inputPeakText, inputMeterDb, " dB");
 
     cacheNumber(
         inputRmsText, processor.getInputRms(), " dB");
@@ -696,7 +833,7 @@ void KickDuck1AudioProcessorEditor::updateMeters()
         inputLufsText, processor.getInputLufs(), " LUFS");
 
     cacheNumber(
-        outputPeakText, processor.getOutputPeak(), " dB");
+        outputPeakText, outputMeterDb, " dB");
 
     cacheNumber(
         outputRmsText, processor.getOutputRms(), " dB");
@@ -711,69 +848,33 @@ void KickDuck1AudioProcessorEditor::updateMeters()
         kickRmsText, processor.getKickRms(), " dB");
 
     cacheNumber(
-        grDbText, processor.getGainReductionDb(), " dB");
+        grDbText, grMeterDb, " dB");
 
     cacheNumber(
-        grPercentText, processor.getGainReductionPercent(), " %");
+        grPercentText, (1.0f - std::pow(10.0f, grMeterDb / 20.0f)) * 100.0f, " %");
 
     duckText =
         "DUCK  "
         + formatPercent(processor.getCurrentDuck() * 100.0f)
-        + "   •   AMOUNT  "
+        + "   |   AMOUNT  "
         + formatPercent(amount * 100.0f);
 
     sidechainText =
         processor.isSidechainConnected()
-            ? "●  SIDECHAIN ACTIVE"
-            : "○  SIDECHAIN NOT CONNECTED";
+            ? "SIDECHAIN ACTIVE"
+            : "BPM DUCKING";
 }
 
 void KickDuck1AudioProcessorEditor::updateWaveform()
 {
-    // Capture approximately every half second and hold the frame.
-    // This preserves the existing non-scrolling snapshot behaviour.
-    ++waveformFrameCounter;
-
-    if (waveformFrameCounter < 12)
-        return;
-
-    waveformFrameCounter = 0;
-
-    const double sr = processor.getSampleRate();
-
-    if (!std::isfinite(sr) || sr <= 0.0)
-        return;
-
-    // Fixed two-beat window. LENGTH changes the curve,
-    // not the waveform's horizontal scale.
-    double bpm = 120.0;
-
-    if (auto* playHead = processor.getPlayHead())
-    {
-        if (auto position = playHead->getPosition())
-        {
-            if (position->getBpm().hasValue())
-                bpm = *position->getBpm();
-        }
-    }
-
-    if (!std::isfinite(bpm) || bpm <= 0.0)
-        bpm = 120.0;
-
-    const double cycleSeconds =
-        juce::jlimit(0.35, 2.50, 2.0 / (bpm / 60.0));
-
-    const int samples =
-        juce::jlimit(
-            1,
-            96000,
-            static_cast<int>(std::round(sr * cycleSeconds)));
-
-    curveEditor.setWaveformsFromProcessor(processor, samples);
+    curveEditor.setWaveformsFromProcessor(processor);
+    signalScope.update(processor);
 }
 
 KickDuck1AudioProcessorEditor::CurveEditor::CurveEditor()
 {
+    points.reserve(maxCurvePoints);
+    storedPoints.reserve(maxCurvePoints);
     setMouseCursor(juce::MouseCursor::PointingHandCursor);
 }
 
@@ -786,14 +887,17 @@ KickDuck1AudioProcessorEditor::CurveEditor::graphBounds() const
 void KickDuck1AudioProcessorEditor::CurveEditor::setPoints(
     const std::vector<DuckingCurve::Point>& p)
 {
-    points = p;
+    storedPoints.assign(p.begin(), p.begin() + std::min(p.size(), static_cast<size_t>(maxCurvePoints)));
+    if (storedPoints.size() < 2)
+        storedPoints = DuckingCurve::defaultPoints();
+    updateEffectivePoints();
+}
 
-    if (points.size() < 2)
-        points = defaultCurve();
-
-    if (points.size() > maxCurvePoints)
-        points.resize(maxCurvePoints);
-
+void KickDuck1AudioProcessorEditor::CurveEditor::updateEffectivePoints()
+{
+    points.assign(storedPoints.begin(), storedPoints.end());
+    DuckingCurve::applyControls(points.data(), static_cast<int>(points.size()),
+                               length, attack, release, cycleSeconds, onsetAttack);
     repaint();
 }
 
@@ -825,15 +929,12 @@ void KickDuck1AudioProcessorEditor::CurveEditor::normalizeWaveform(
 }
 
 void KickDuck1AudioProcessorEditor::CurveEditor::setWaveformsFromProcessor(
-    KickDuck1AudioProcessor& p,
-    int samplesToCopy)
+    KickDuck1AudioProcessor& p)
 {
-    p.copyWaveformSnapshot(
-        bassInWaveform.data(),
-        bassOutWaveform.data(),
-        kickWaveform.data(),
-        maxWaveformPoints,
-        samplesToCopy);
+    double frameSeconds = 0.0;
+    if (!p.copyTriggeredWaveform(bassInWaveform.data(), bassOutWaveform.data(),
+                                 kickWaveform.data(), waveformVersion, frameSeconds))
+        return;
 
     // Visual-only scaling.
     //
@@ -914,41 +1015,17 @@ void KickDuck1AudioProcessorEditor::CurveEditor::setAmount(float v)
     repaint();
 }
 
-void KickDuck1AudioProcessorEditor::CurveEditor::setLength(
-    float musicalLength)
+void KickDuck1AudioProcessorEditor::CurveEditor::setControls(
+    float musicalLength, float attackMs, float releaseMs, double seconds, float onsetMs)
 {
-    if (points.size() < 2)
+    if (length == musicalLength && attack == attackMs && release == releaseMs && cycleSeconds == seconds && onsetAttack == onsetMs)
         return;
-
-    // LENGTH controls the horizontal position of point #2.
-    // Preserve space for the recovery part of the curve.
-    const float n =
-        juce::jlimit(
-            0.0f,
-            1.0f,
-            (musicalLength - 0.125f) / (2.0f - 0.125f));
-
-    const float targetX = 0.05f + n * 0.63f;
-
-    float maxX = 0.98f;
-
-    if (points.size() > 2)
-        maxX = points[2].x - 0.002f;
-
-    maxX = std::max(points[0].x + 0.004f, maxX);
-
-    const float newX =
-        juce::jlimit(
-            points[0].x + 0.002f,
-            maxX,
-            targetX);
-
-    if (std::abs(points[1].x - newX) > 0.0005f)
-    {
-        points[1].x = newX;
-        notifyPointsChanged();
-        repaint();
-    }
+    length = musicalLength;
+    attack = attackMs;
+    release = releaseMs;
+    cycleSeconds = seconds;
+    onsetAttack = onsetMs;
+    updateEffectivePoints();
 }
 
 void KickDuck1AudioProcessorEditor::CurveEditor::setPhase(float v)
@@ -1025,8 +1102,11 @@ int KickDuck1AudioProcessorEditor::CurveEditor::findPoint(
 
 void KickDuck1AudioProcessorEditor::CurveEditor::notifyPointsChanged()
 {
+    storedPoints.assign(points.begin(), points.end());
+    for (auto& p : storedPoints) p.y *= amount;
     if (onPointsChanged)
-        onPointsChanged(points);
+        onPointsChanged(storedPoints);
+    updateEffectivePoints();
 }
 
 void KickDuck1AudioProcessorEditor::CurveEditor::drawWaveform(
@@ -1085,13 +1165,17 @@ void KickDuck1AudioProcessorEditor::CurveEditor::drawCurve(
         return;
 
     g.setColour(curveColour);
-
-    for (size_t i = 1; i < points.size(); ++i)
+    const auto graph = graphBounds();
+    const int steps = std::clamp(static_cast<int>(graph.getWidth()), 256, 1600);
+    auto previous = pointToScreen({0.0f, DuckingCurve::sample(points.data(), static_cast<int>(points.size()), 0.0f, rounded)});
+    for (int i = 1; i <= steps; ++i)
     {
-        const auto a = pointToScreen(points[i - 1]);
-        const auto b = pointToScreen(points[i]);
-
-        g.drawLine(a.x, a.y, b.x, b.y, 3.0f);
+        const float x = static_cast<float>(i) / steps;
+        const float depth = DuckingCurve::sample(points.data(), static_cast<int>(points.size()), x, rounded);
+        const juce::Point<float> next {graph.getX() + x * graph.getWidth(),
+                                       graph.getY() + depth * amount * graph.getHeight()};
+        g.drawLine({previous, next}, 3.0f);
+        previous = next;
     }
 }
 
@@ -1134,10 +1218,10 @@ void KickDuck1AudioProcessorEditor::CurveEditor::paint(
     // Bass Out retains its size relative to Bass In.
     // Kick uses an independent visual-only normalization.
     drawWaveform(
-        g, bassOutWaveform, b, bassOutColour, 1.15f);
+        g, kickWaveform, b, kickColour, 1.9f);
 
     drawWaveform(
-        g, kickWaveform, b, kickColour, 1.9f);
+        g, bassOutWaveform, b, bassOutColour, 1.15f);
 
     // Duck curve overlays the same graph.
     drawCurve(g);
@@ -1188,7 +1272,7 @@ void KickDuck1AudioProcessorEditor::CurveEditor::paint(
     g.setColour(muted);
     g.setFont(font(8.5f, true));
     g.drawText(
-        "ONE CYCLE  •  DRAG POINTS  •  DOUBLE-CLICK ADD  •  RIGHT-CLICK DELETE",
+        "ONE CYCLE  |  DRAG POINTS  |  DOUBLE-CLICK ADD  |  RIGHT-CLICK DELETE",
         b.getRight() - 440.0f,
         b.getBottom() - 19.0f,
         430.0f,
@@ -1233,6 +1317,18 @@ void KickDuck1AudioProcessorEditor::CurveEditor::paint(
     }
 }
 
+void KickDuck1AudioProcessorEditor::CurveEditor::mouseMove(const juce::MouseEvent& e)
+{
+    const int index = findPoint(e.position);
+    if (index == static_cast<int>(points.size()) - 1)
+        setTooltip("End depth at " + juce::String(cycleSeconds * 1000.0, 0)
+            + " ms. Shapes the final TAIL segment. A new kick can restart the cycle before it reaches this point.");
+    else if (index == 0)
+        setTooltip("Depth reached after ATTACK. Drag horizontally to set attack time, vertically to set ducking depth.");
+    else
+        setTooltip("Drag points to shape gain reduction. Top: no ducking; bottom: Amount depth.");
+}
+
 void KickDuck1AudioProcessorEditor::CurveEditor::mouseDown(
     const juce::MouseEvent& e)
 {
@@ -1271,7 +1367,8 @@ void KickDuck1AudioProcessorEditor::CurveEditor::mouseDrag(
 
     if (selectedPoint == 0)
     {
-        x = 0.0f;
+        x = juce::jlimit(0.0f, std::min(100.0f / static_cast<float>(cycleSeconds * 1000.0),
+                                      std::max(0.0f, points[1].x - 0.002f)), x);
     }
     else if (selectedPoint == static_cast<int>(points.size()) - 1)
     {
@@ -1293,12 +1390,15 @@ void KickDuck1AudioProcessorEditor::CurveEditor::mouseDrag(
         }
     }
 
-    // Reverse AMOUNT scaling to recover the stored duck depth.
-    // At zero AMOUNT the display is flat, so preserve existing Y.
-    float y = points[static_cast<size_t>(selectedPoint)].y;
-
-    if (amount > 0.001f)
-        y = visual / amount;
+    // Raising the deepest reduction also raises AMOUNT. Rescale the other
+    // normalized depths so their displayed positions stay exactly where they were.
+    if (visual > amount)
+    {
+        const float scale = amount / std::max(0.000001f, visual);
+        for (auto& p : points) p.y *= scale;
+        amount = visual;
+    }
+    const float y = amount > 0.000001f ? visual / amount : 0.0f;
 
     points[static_cast<size_t>(selectedPoint)].x =
         juce::jlimit(0.0f, 1.0f, x);
@@ -1330,8 +1430,13 @@ void KickDuck1AudioProcessorEditor::CurveEditor::mouseDoubleClick(
     const float visual =
         screenYToVisualNorm(e.position.y);
 
-    const float y =
-        amount > 0.001f ? visual / amount : 0.0f;
+    if (visual > amount)
+    {
+        const float scale = amount / std::max(0.000001f, visual);
+        for (auto& p : points) p.y *= scale;
+        amount = visual;
+    }
+    const float y = amount > 0.000001f ? visual / amount : 0.0f;
 
     points.push_back({
         x,
