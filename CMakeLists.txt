@@ -55,8 +55,6 @@ target_sources(KickDuck1 PRIVATE
     Source/WaveformHistory.cpp
     Source/WaveformHistory.h
 
-    Source/PeakMeter.cpp
-    Source/PeakMeter.h
 )
 
 target_compile_definitions(KickDuck1 PRIVATE
@@ -80,6 +78,19 @@ if(BUILD_TESTING)
     target_compile_definitions(KickDuck1Tests PRIVATE
         "$<TARGET_PROPERTY:KickDuck1,COMPILE_DEFINITIONS>")
     target_link_libraries(KickDuck1Tests PRIVATE KickDuck1)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_sources(KickDuck1Tests PRIVATE Tests/AllocationProbe.cpp)
+        target_compile_definitions(KickDuck1Tests PRIVATE KICKDUCK_ALLOCATION_PROBE=1)
+        target_link_options(KickDuck1Tests PRIVATE
+            -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc
+            -Wl,--wrap=posix_memalign -Wl,--wrap=aligned_alloc)
+    endif()
+    find_package(Threads REQUIRED)
+    add_executable(KickDuck1RealtimeTests Tests/RealtimeTests.cpp)
+    target_include_directories(KickDuck1RealtimeTests PRIVATE Source)
+    target_link_libraries(KickDuck1RealtimeTests PRIVATE Threads::Threads)
+    add_test(NAME KickDuck1Realtime COMMAND KickDuck1RealtimeTests)
+    set_tests_properties(KickDuck1Realtime PROPERTIES TIMEOUT 30)
     add_test(NAME KickDuck1Processor COMMAND KickDuck1Tests)
     set_tests_properties(KickDuck1Processor PROPERTIES TIMEOUT 30)
 endif()

@@ -22,6 +22,7 @@ public:
     void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
     juce::AudioProcessorEditor* createEditor() override;
+    juce::AudioProcessorParameter* getBypassParameter() const override { return apvts.getParameter("bypass"); }
     bool hasEditor() const override { return true; }
     const juce::String getName() const override { return JucePlugin_Name; }
     bool acceptsMidi() const override { return false; }
@@ -78,6 +79,10 @@ public:
     bool tryCopyCurvePoints(std::vector<DuckingCurve::Point>& points) const;
 
 private:
+    static_assert(std::atomic<float>::is_always_lock_free, "DSP meters must be lock-free");
+    static_assert(std::atomic<double>::is_always_lock_free, "Timing snapshots must be lock-free");
+    static_assert(std::atomic<int>::is_always_lock_free, "Curve ownership must be lock-free");
+    static_assert(std::atomic<bool>::is_always_lock_free, "DSP flags must be lock-free");
     static constexpr int maxCurvePoints = DuckingCurve::maxPoints;
     // Serializes GUI and host state writers; never taken by processBlock.
     std::mutex curveUpdateMutex;
@@ -115,6 +120,7 @@ private:
     juce::SmoothedValue<float> outputDbSmoother;
     juce::SmoothedValue<float> amountSmoother;
     juce::SmoothedValue<float> mixSmoother;
+    juce::SmoothedValue<float> bypassSmoother;
 
     // Three preallocated curve buffers. Writers use an inactive, unreserved slot.
     // Audio reserves the active one for a block, copies it to a local fixed

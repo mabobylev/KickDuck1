@@ -36,6 +36,20 @@ namespace
     }
 }
 
+void KickDuck1AudioProcessorEditor::CompactButton::paintButton(
+    juce::Graphics& g, bool highlighted, bool down)
+{
+    const bool selected = getToggleState();
+    const auto box = getLocalBounds().toFloat().reduced(0.5f);
+    g.setColour(selected ? curveColour.withAlpha(0.18f) : (highlighted || down ? panel3 : panel2));
+    g.fillRoundedRectangle(box, 5.0f);
+    g.setColour(selected ? curveColour : gridBright);
+    g.drawRoundedRectangle(box, 5.0f, 1.0f);
+    g.setColour(selected || highlighted ? curveColour : ::text);
+    g.setFont(font(10.5f, true));
+    g.drawText(getButtonText(), getLocalBounds().reduced(3, 0), juce::Justification::centred);
+}
+
 KickDuck1AudioProcessorEditor::CurvePresetButton::CurvePresetButton(DuckingCurve::Preset preset)
     : juce::Button(juce::String("Curve preset: ") + DuckingCurve::presetName(preset)),
       points(DuckingCurve::presetPoints(preset))
@@ -97,6 +111,9 @@ void KickDuck1AudioProcessorEditor::SignalScope::rebuildPaths()
 {
     compressionPath.clear();
     outputShape.clear();
+    // clear() retains capacity; reserve for the maximum scope width once.
+    compressionPath.preallocateSpace(TriggeredWaveform::points * 3 + 8);
+    outputShape.preallocateSpace(TriggeredWaveform::points * 3 + 16);
     const auto graph = getLocalBounds().toFloat().reduced(10.0f, 5.0f).withTrimmedTop(13.0f);
     const int columns = std::min(TriggeredWaveform::points, static_cast<int>(graph.getWidth()));
     if (columns < 2 || graph.getHeight() <= 0.0f) return;
@@ -275,22 +292,58 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
         updateMeters();
     };
     addChildComponent(legacyMixButton);
-    triggerModeLabel.setName("Trigger Mode");
-    triggerModeLabel.setFont(font(12.0f, true));
-    triggerModeLabel.setColour(juce::Label::textColourId, bassOutColour);
-    triggerModeLabel.setJustificationType(juce::Justification::centred);
-    triggerModeLabel.setTooltip("Selected by AUX connection, not by silence between kick hits. Legacy saved mode is retained until USE CONNECTION is clicked.");
-    addAndMakeVisible(triggerModeLabel);
-    addChildComponent(automaticRoutingButton);
-    automaticRoutingButton.setTooltip("Switch this saved project from its legacy mode to automatic selection by AUX connection.");
-    automaticRoutingButton.onClick = [this]
+    bypassButton.setName("Bypass");
+    bypassButton.setClickingTogglesState(true);
+    bypassButton.setColour(juce::TextButton::buttonOnColourId, kickColour.withAlpha(0.35f));
+    bypassButton.setTooltip("Smoothly bypass ducking and input/output gain. The detector and clock continue running.");
+    addAndMakeVisible(bypassButton);
+    bypassAttachment = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(processor.apvts, "bypass", bypassButton);
+    const juce::StringArray modeNames {"AUTO", "AUDIO", "HOST SYNC"};
+    const juce::StringArray modeTips {
+        "Select Audio Trigger with AUX connected, Host Sync without AUX. Silence between kicks does not change mode.",
+        "Trigger the curve from kick AUX only.",
+        "Repeat the curve on the host transport grid, regardless of AUX. Stop returns dry."};
+    for (int i = 0; i < static_cast<int>(modeButtons.size()); ++i)
     {
-        auto* p = processor.apvts.getParameter("automaticRouting");
-        p->beginChangeGesture();
-        p->setValueNotifyingHost(1.0f);
-        p->endChangeGesture();
-        updateMeters();
-    };
+        auto& button = modeButtons[i];
+        button.setButtonText(modeNames[i]);
+        button.setName("Mode " + modeNames[i]);
+        button.setTooltip(modeTips[i]);
+        button.setColour(juce::TextButton::buttonOnColourId, curveColour.withAlpha(0.3f));
+        button.onClick = [this, i]
+        {
+            const auto set = [this](const char* id, float value)
+            {
+                auto* p = processor.apvts.getParameter(id);
+                p->beginChangeGesture();
+                p->setValueNotifyingHost(p->convertTo0to1(value));
+                p->endChangeGesture();
+            };
+            // Set the explicit mode before disabling automatic routing.
+            if (i != 0) set("triggerMode", static_cast<float>(i));
+            set("automaticRouting", i == 0 ? 1.0f : 0.0f);
+            updateMeters();
+        };
+        addAndMakeVisible(button);
+    }
+    const juce::StringArray divisions {"1/16", "1/8", "1/4", "1/2", "1 BAR"};
+    for (int i = 0; i < static_cast<int>(divisionButtons.size()); ++i)
+    {
+        auto& button = divisionButtons[i];
+        button.setButtonText(divisions[i]);
+        button.setName("Division " + divisions[i]);
+        button.setColour(juce::TextButton::buttonOnColourId, bassOutColour.withAlpha(0.25f));
+        button.setTooltip("Cycle length; also repetition interval in Host Sync. 1 BAR means four quarter notes (4/4).");
+        button.onClick = [this, i]
+        {
+            auto* p = processor.apvts.getParameter("cycleDivision");
+            p->beginChangeGesture();
+            p->setValueNotifyingHost(p->convertTo0to1(static_cast<float>(i)));
+            p->endChangeGesture();
+            updateMeters();
+        };
+        addAndMakeVisible(button);
+    }
     lengthSlider.setTooltip("Position of point 2: Length / 2 of the selected cycle. Does not delay the trigger.");
     releaseSlider.setTooltip("Time from the kick trigger to point 3 (recovery target). Not a compressor release constant.");
     attackSlider.setTooltip("Duration from the penultimate point to the end of the cycle. Not compressor attack or pre-delay.");
@@ -550,13 +603,13 @@ void KickDuck1AudioProcessorEditor::resized()
 {
     resetCurveButton.setBounds(getWidth() - 120, 24, 98, 25);
     signalScope.setBounds(300, 14, getWidth() - 610, 50);
-    auto content = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(190).reduced(18, 0);
+    auto content = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(210).reduced(18, 0);
     layout.meters = content.removeFromRight(320);
     content.removeFromRight(10);
     layout.graph = content;
     curveEditor.setBounds(layout.graph);
 
-    auto controls = getLocalBounds().removeFromBottom(176).reduced(18, 7);
+    auto controls = getLocalBounds().removeFromBottom(196).reduced(18, 7);
     layout.amount = controls.removeFromRight(180);
     controls.removeFromRight(8);
     layout.gains = controls.removeFromRight(200);
@@ -570,9 +623,19 @@ void KickDuck1AudioProcessorEditor::resized()
         label.setBounds(cell.removeFromTop(20));
         slider.setBounds(cell.reduced(2, 0));
     };
-    auto modeRow = layout.shape.withTrimmedTop(130).reduced(8, 0).withHeight(25);
-    triggerModeLabel.setBounds(modeRow.reduced(2, 0));
-    automaticRoutingButton.setBounds(triggerModeLabel.getBounds());
+    auto launch = layout.shape.withTrimmedTop(132).reduced(8, 0);
+    const int launchWidth = std::min(320, launch.getWidth());
+    launch = launch.withSizeKeepingCentre(launchWidth, launch.getHeight());
+    auto modes = launch.removeFromTop(20);
+    const int modeWidth = modes.getWidth() / 4;
+    for (auto& button : modeButtons)
+        button.setBounds(modes.removeFromLeft(modeWidth).reduced(2, 0));
+    bypassButton.setBounds(modes.reduced(2, 0));
+    launch.removeFromTop(4);
+    auto divisions = launch.removeFromTop(20);
+    const int divisionWidth = divisions.getWidth() / 5;
+    for (auto& button : divisionButtons)
+        button.setBounds(divisions.removeFromLeft(divisionWidth).reduced(2, 0));
     auto shape = layout.shape.withTrimmedTop(28).reduced(4, 0);
     // Keep timing controls close together even in a wide editor.
     const int cellWidth = std::min(110, shape.getWidth() / 4);
@@ -887,9 +950,13 @@ void KickDuck1AudioProcessorEditor::updateMeters()
     const int legacyMode = static_cast<int>(processor.apvts.getRawParameterValue("triggerMode")->load());
     const bool synced = automatic ? !connected : (legacyMode == 2 || (legacyMode == 0 && !connected));
     const juce::String modeName = synced ? "HOST SYNC" : "AUDIO TRIGGER";
-    triggerModeLabel.setText(modeName, juce::dontSendNotification);
-    automaticRoutingButton.setVisible(!automatic);
-    sidechainText = modeName + (automatic ? "" : " | SAVED MODE");
+    const int selectedMode = automatic || legacyMode == 0 ? 0 : legacyMode;
+    for (int i = 0; i < static_cast<int>(modeButtons.size()); ++i)
+        modeButtons[i].setToggleState(i == selectedMode, juce::dontSendNotification);
+    const int division = static_cast<int>(processor.apvts.getRawParameterValue("cycleDivision")->load());
+    for (int i = 0; i < static_cast<int>(divisionButtons.size()); ++i)
+        divisionButtons[i].setToggleState(i == division, juce::dontSendNotification);
+    sidechainText = (automatic || legacyMode == 0 ? "AUTO | " : "") + modeName;
 
 }
 

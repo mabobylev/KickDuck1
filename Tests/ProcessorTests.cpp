@@ -1,4 +1,8 @@
 #include "PluginProcessor.h"
+#if KICKDUCK_ALLOCATION_PROBE
+#include "AllocationProbe.h"
+extern "C" void* __wrap_malloc(std::size_t);
+#endif
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -134,8 +138,8 @@ void musicalModeTests()
     automatic->processBlock(autoBuffer, autoMidi);
     require(std::abs(autoBuffer.getSample(0, 0) - 0.15f) < 1.0e-5f,
             "Automatic disconnected AUX did not select Host Sync");
-    require(std::abs(automatic->getCycleSeconds() - 0.5) < 1.0e-8,
-            "Automatic routing still used removed cycle division");
+    require(std::abs(automatic->getCycleSeconds() - 2.0) < 1.0e-8,
+            "Automatic routing did not apply selected division");
     clock.playing = false;
     autoBuffer.clear();
     for (int i = 0; i < 512; ++i) autoBuffer.setSample(0, i, 0.5f);
@@ -165,12 +169,23 @@ void musicalModeTests()
     require(restored->apvts.getRawParameterValue("triggerMode")->load() == 2
             && restored->apvts.getRawParameterValue("cycleDivision")->load() == 4,
             "Musical mode state round trip failed");
+    auto v7 = p->apvts.copyState();
+    v7.setProperty("stateVersion", 7, nullptr);
+    for (auto child : v7)
+        if (child.getProperty("id").toString() == "automaticRouting") child.setProperty("value", 1.0f, nullptr);
+    juce::MemoryBlock v7data;
+    juce::AudioProcessor::copyXmlToBinary(*v7.createXml(), v7data);
+    restored->setStateInformation(v7data.getData(), static_cast<int>(v7data.getSize()));
+    require(restored->apvts.getRawParameterValue("cycleDivision")->load() == 2,
+            "v7 automatic state changed its effective quarter-note duration");
     auto legacy = p->apvts.copyState();
     for (int i = legacy.getNumChildren() - 1; i >= 0; --i)
         if (legacy.getChild(i).getProperty("id") == juce::var("triggerMode")
             || legacy.getChild(i).getProperty("id") == juce::var("cycleDivision")
-            || legacy.getChild(i).getProperty("id") == juce::var("automaticRouting"))
+            || legacy.getChild(i).getProperty("id") == juce::var("automaticRouting")
+            || legacy.getChild(i).getProperty("id") == juce::var("bypass"))
             legacy.removeChild(i, nullptr);
+    parameter(*restored, "bypass", 1);
     juce::AudioProcessor::copyXmlToBinary(*legacy.createXml(), data);
     restored->setStateInformation(data.getData(), static_cast<int>(data.getSize()));
     require(restored->apvts.getRawParameterValue("triggerMode")->load() == 0
@@ -178,6 +193,133 @@ void musicalModeTests()
             "Legacy state did not restore Auto quarter-note mode");
     require(restored->apvts.getRawParameterValue("automaticRouting")->load() == 0,
             "Legacy routing semantics changed during load");
+    require(restored->apvts.getRawParameterValue("bypass")->load() == 0, "Legacy state retained previous bypass");
+}
+
+void bypassTests()
+{
+    for (double sr : {44100.0, 48000.0, 192000.0})
+        for (int block : {1, 17, 64, 512})
+        {
+            auto p = std::make_unique<KickDuck1AudioProcessor>();
+            parameter(*p, "input", -6);
+            parameter(*p, "output", 12);
+            p->setCurvePoints({{0, 1}, {1, 1}});
+            prepare(*p);
+            p->prepareToPlay(sr, block);
+            require(p->getBypassParameter() == p->apvts.getParameter("bypass"), "Host bypass parameter missing");
+            juce::MidiBuffer midi;
+            juce::AudioBuffer<float> buffer(4, block);
+            const auto fill = [&]()
+            {
+                for (int i = 0; i < buffer.getNumSamples(); ++i)
+                {
+                    buffer.setSample(0, i, 0.5f);
+                    buffer.setSample(1, i, -0.25f);
+                    buffer.setSample(2, i, 1);
+                    buffer.setSample(3, i, 1);
+                }
+            };
+            fill();
+            p->processBlock(buffer, midi);
+            const float processedGain = std::pow(10.0f, 6.0f / 20.0f) * 0.3f;
+            const int ramp = static_cast<int>(sr * 0.02);
+            for (bool bypass : {true, false})
+            {
+                parameter(*p, "bypass", bypass ? 1 : 0);
+                for (int offset = 0; offset < ramp + block; offset += block)
+                {
+                    fill();
+                    p->processBlock(buffer, midi);
+                    for (int i = 0; i < block; ++i)
+                    {
+                        const float t = std::min(1.0f, static_cast<float>(offset + i + 1) / ramp);
+                        const float active = bypass ? 1 - t : t;
+                        const float gain = 1 + (processedGain - 1) * active;
+                        require(std::abs(buffer.getSample(0, i) - 0.5f * gain) < 3.0e-5f
+                                && std::abs(buffer.getSample(1, i) + 0.25f * gain) < 3.0e-5f,
+                                "Bypass was not a 20 ms full-signal crossfade");
+                    }
+                }
+                if (bypass) require(p->getGainReductionDb() == 0, "Bypassed DSP reports actual GR");
+            }
+            parameter(*p, "bypass", 1);
+            juce::MemoryBlock state;
+            p->getStateInformation(state);
+            auto restored = std::make_unique<KickDuck1AudioProcessor>();
+            restored->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+            prepare(*restored);
+            require(restored->apvts.getRawParameterValue("bypass")->load() == 1
+                    && process(*restored) == 0.5f, "Saved bypass did not restore full dry signal");
+        }
+}
+
+void allocationTests()
+{
+#if KICKDUCK_ALLOCATION_PROBE
+    AllocationProbe::begin();
+    auto* probe = ::operator new(32);
+    auto* heapProbe = __wrap_malloc(16);
+    const auto selfTest = AllocationProbe::end();
+    std::free(heapProbe);
+    ::operator delete(probe);
+    require(selfTest.cpp == 1 && selfTest.heap == 1, "Allocation probe did not detect explicit C++ allocation");
+    std::size_t callbacks = 0;
+    for (double sr : {44100.0, 48000.0, 192000.0})
+        for (int block : {1, 17, 64, 512})
+            for (int mode = 0; mode < 3; ++mode)
+            for (bool aux : {false, true})
+            for (bool mono : {false, true})
+            {
+                auto p = std::make_unique<KickDuck1AudioProcessor>();
+                prepare(*p);
+                auto layout = p->getBusesLayout();
+                const auto channels = mono ? juce::AudioChannelSet::mono() : juce::AudioChannelSet::stereo();
+                layout.inputBuses.set(0, channels);
+                layout.outputBuses.set(0, channels);
+                layout.inputBuses.set(1, aux ? channels : juce::AudioChannelSet::disabled());
+                require(p->setBusesLayout(layout), "Allocation test layout rejected");
+                parameter(*p, "automaticRouting", mode == 0 ? 1 : 0);
+                parameter(*p, "triggerMode", static_cast<float>(mode));
+                p->prepareToPlay(sr, block);
+                juce::AudioBuffer<float> buffer(4, block);
+                juce::MidiBuffer midi;
+                for (int n = 0; n < 32; ++n)
+                {
+                    buffer.clear();
+                    for (int i = 0; i < block; ++i)
+                    {
+                        buffer.setSample(0, i, 0.5f);
+                        buffer.setSample(mono ? 1 : 2, i, n % 8 == 0 ? 1.0f : 0.0f);
+                    }
+                    parameter(*p, "amount", static_cast<float>(20 + n));
+                    parameter(*p, "cycleDivision", static_cast<float>(n % 5));
+                    parameter(*p, "bypass", static_cast<float>(n % 2));
+                    if (n % 7 == 0) p->setCurvePoints({{0, 0.8f}, {0.5f, 0}, {1, 0}});
+                    AllocationProbe::begin();
+                    p->processBlock(buffer, midi);
+                    const auto count = AllocationProbe::end();
+                    require(count.cpp == 0 && count.heap == 0, "processBlock allocated memory");
+                    ++callbacks;
+                }
+            }
+    auto p = std::make_unique<KickDuck1AudioProcessor>();
+    prepare(*p);
+    auto editor = std::unique_ptr<juce::AudioProcessorEditor>(p->createEditor());
+    juce::Image image(juce::Image::ARGB, editor->getWidth(), editor->getHeight(), true);
+    juce::Graphics graphics(image);
+    editor->paintEntireComponent(graphics, true);
+    AllocationProbe::begin();
+    editor->paintEntireComponent(graphics, true);
+    const auto paint = AllocationProbe::end();
+    juce::Thread::sleep(40);
+    AllocationProbe::begin();
+    juce::Timer::callPendingTimersSynchronously();
+    const auto timer = AllocationProbe::end();
+    std::cout << "Allocation audit: " << callbacks << " DSP callbacks, zero C++/wrapped heap allocations; "
+              << "GUI paint (including JUCE): " << paint.cpp << "/" << paint.heap
+              << "; timer dispatch (including JUCE): " << timer.cpp << "/" << timer.heap << "\n";
+#endif
 }
 
 void stateTests()
@@ -771,6 +913,26 @@ void editorLayoutPreviewsTest()
     }
     parameter(*p, "mix", 63.0f);
     auto editor = std::unique_ptr<juce::AudioProcessorEditor>(p->createEditor());
+    for (const auto* name : {"Mode AUDIO", "Mode HOST SYNC", "Mode AUTO"})
+    {
+        auto* button = dynamic_cast<juce::TextButton*>(namedChild(*editor, name));
+        require(button != nullptr, "Mode button missing");
+        button->onClick();
+        const bool automatic = p->apvts.getRawParameterValue("automaticRouting")->load() > 0.5f;
+        require(automatic == (juce::String(name) == "Mode AUTO"), "Mode button did not update routing");
+        if (!automatic)
+            require(p->apvts.getRawParameterValue("triggerMode")->load() == (juce::String(name) == "Mode AUDIO" ? 1 : 2),
+                    "Mode button did not update explicit mode");
+    }
+    int divisionIndex = 0;
+    for (const auto* name : {"Division 1/16", "Division 1/8", "Division 1/4", "Division 1/2", "Division 1 BAR"})
+    {
+        auto* button = dynamic_cast<juce::TextButton*>(namedChild(*editor, name));
+        require(button != nullptr, "Division button missing");
+        button->onClick();
+        require(p->apvts.getRawParameterValue("cycleDivision")->load() == divisionIndex++, "Division button did not update parameter");
+    }
+    dynamic_cast<juce::TextButton*>(namedChild(*editor, "Division 1/4"))->onClick();
     for (auto size : {juce::Point<int>{1050, 680}, {1260, 800}, {1800, 1100}, {1050, 1100}, {1800, 680}})
     {
         editor->setSize(size.x, size.y);
@@ -796,6 +958,17 @@ void editorLayoutPreviewsTest()
             for (const auto& knob : knobs)
                 require(!child->getBounds().intersects(knob), "Preset row overlaps a knob after resize");
         }
+        std::vector<juce::Rectangle<int>> launchButtons;
+        for (auto* child : editor->getChildren())
+            if (child->getName().startsWith("Mode ") || child->getName().startsWith("Division ") || child->getName() == "Bypass")
+            {
+                const auto bounds = child->getBounds();
+                require(editor->getLocalBounds().contains(bounds), "Launch button escaped editor");
+                require(!bounds.intersects(namedChild(*editor, "Ducking curve")->getBounds()), "Launch button overlaps curve");
+                for (const auto& knob : knobs) require(!bounds.intersects(knob), "Launch button overlaps knob");
+                for (const auto& previous : launchButtons) require(!bounds.intersects(previous), "Launch buttons overlap");
+                launchButtons.push_back(bounds);
+            }
         const auto* firstPreset = namedChild(*editor, "Curve preset: Classic");
         for (int i = 0; i < DuckingCurve::presetCount; ++i)
         {
@@ -1458,6 +1631,8 @@ int main()
     const juce::ScopedJuceInitialiser_GUI juceInitialiser;
     try
     {
+        bypassTests();
+        allocationTests();
         musicalModeTests();
         stateTests();
         normalizationTests();

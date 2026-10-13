@@ -32,7 +32,8 @@
       "displayName": "Собрать регрессионные проверки",
       "configurePreset": "dev",
       "targets": [
-        "KickDuck1Tests"
+        "KickDuck1Tests",
+        "KickDuck1RealtimeTests"
       ],
       "jobs": 3
     },

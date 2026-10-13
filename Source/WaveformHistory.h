@@ -12,6 +12,8 @@
 class WaveformHistory
 {
 public:
+    static_assert(std::atomic<float>::is_always_lock_free, "History samples must be lock-free");
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free, "History slots must be lock-free");
     static_assert(std::atomic<std::uint64_t>::is_always_lock_free, "History publication must be lock-free");
 
     explicit WaveformHistory(int capacity)
@@ -22,9 +24,13 @@ public:
 
     void clear() noexcept
     {
-        writeIndex_.store(0, std::memory_order_relaxed);
+        // Single producer: lifecycle reset and push must not overlap.
+        resetEpoch_.fetch_add(1, std::memory_order_acq_rel);
+        std::atomic_thread_fence(std::memory_order_release);
+        writeIndex_.store(0, std::memory_order_release);
         for (int i = 0; i < capacity_; ++i)
             sequence_[i].store(0, std::memory_order_relaxed);
+        resetEpoch_.fetch_add(1, std::memory_order_release);
     }
 
     void push(float bassIn, float bassOut, float kick, float reduction = 0.0f) noexcept
@@ -34,7 +40,11 @@ public:
 
         auto& seq = sequence_[index];
         const std::uint32_t s = seq.load(std::memory_order_relaxed);
-        seq.store(s | 1u, std::memory_order_release); // writer owns slot
+        seq.store(s | 1u, std::memory_order_relaxed); // writer owns slot
+        // If a reader observes any new payload value, its acquire fence
+        // synchronizes with this fence and forces its final sequence check
+        // to observe the invalidation (or a later generation).
+        std::atomic_thread_fence(std::memory_order_release);
         bassIn_[index].store(bassIn, std::memory_order_relaxed);
         bassOut_[index].store(bassOut, std::memory_order_relaxed);
         kick_[index].store(kick, std::memory_order_relaxed);
@@ -55,6 +65,19 @@ public:
         if (bassInOut == nullptr || bassOutOut == nullptr || kickOut == nullptr || points <= 0)
             return;
 
+        const auto epoch = resetEpoch_.load(std::memory_order_acquire);
+        const auto zeroOutput = [&]()
+        {
+            std::fill_n(bassInOut, points, 0.0f);
+            std::fill_n(bassOutOut, points, 0.0f);
+            std::fill_n(kickOut, points, 0.0f);
+            if (reductionOut != nullptr) std::fill_n(reductionOut, points, 0.0f);
+        };
+        if (epoch & 1u)
+        {
+            zeroOutput();
+            return;
+        }
         const int available = std::clamp(samplesToCopy, 1, capacity_);
         const std::uint64_t end = writeIndex_.load(std::memory_order_acquire);
         const auto present = std::min(end, static_cast<std::uint64_t>(available));
@@ -89,6 +112,7 @@ public:
                     const float vo = bassOut_[index].load(std::memory_order_relaxed);
                     const float vk = kick_[index].load(std::memory_order_relaxed);
                     const float vr = reduction_[index].load(std::memory_order_relaxed);
+                    std::atomic_thread_fence(std::memory_order_acquire);
                     const std::uint32_t b = sequence_[index].load(std::memory_order_acquire);
                     if (a == b)
                     {
@@ -112,6 +136,10 @@ public:
             kickOut[p] = kick;
             if (reductionOut != nullptr) reductionOut[p] = maxReduction;
         }
+        // Reject snapshots spanning a reset, even if slot generations restarted
+        // with the same numbers. Output is silence rather than stale audio.
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (resetEpoch_.load(std::memory_order_acquire) != epoch) zeroOutput();
     }
 
     int capacity() const noexcept { return capacity_; }
@@ -120,6 +148,7 @@ private:
     static constexpr int maxCapacity = 524288;
     const int capacity_;
 
+    std::atomic<std::uint64_t> resetEpoch_ {0};
     alignas(64) std::atomic<std::uint64_t> writeIndex_ { 0 };
     std::array<std::atomic<std::uint32_t>, maxCapacity> sequence_ {};
     std::array<std::atomic<float>, maxCapacity> bassIn_ {};

@@ -17,6 +17,13 @@ public:
     void resized() override;
 
 private:
+    class CompactButton : public juce::TextButton
+    {
+    public:
+        using juce::TextButton::TextButton;
+        void paintButton(juce::Graphics&, bool highlighted, bool down) override;
+    };
+
     class SignalScope : public juce::Component, public juce::SettableTooltipClient
     {
     public:
@@ -119,8 +126,10 @@ private:
     SignalScope signalScope;
     juce::TextButton resetCurveButton {"RESET CURVE"};
     juce::TextButton legacyMixButton;
-    juce::Label triggerModeLabel;
-    juce::TextButton automaticRoutingButton {"USE CONNECTION"};
+    std::array<CompactButton, 3> modeButtons;
+    std::array<CompactButton, 5> divisionButtons;
+    CompactButton bypassButton {"BYPASS"};
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::array<std::unique_ptr<CurvePresetButton>, DuckingCurve::presetCount> presetButtons;
     juce::TooltipWindow tooltipWindow {this, 500};
 

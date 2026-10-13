@@ -51,6 +51,7 @@ KickDuck1AudioProcessor::createParameterLayout()
     parameters.push_back(std::make_unique<juce::AudioParameterChoice>("triggerMode", "Trigger Mode", juce::StringArray{"Auto", "Audio Trigger", "Host Sync"}, 0));
     parameters.push_back(std::make_unique<juce::AudioParameterChoice>("cycleDivision", "Cycle Division", juce::StringArray{"1/16", "1/8", "1/4", "1/2", "1 bar (4/4)"}, 2));
     parameters.push_back(std::make_unique<juce::AudioParameterBool>("automaticRouting", "Automatic Routing", true));
+    parameters.push_back(std::make_unique<juce::AudioParameterBool>("bypass", "Bypass", false));
     return { parameters.begin(), parameters.end() };
 }
 
@@ -76,6 +77,7 @@ void KickDuck1AudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlo
     initialiseSmoother(outputDbSmoother, "output", 1.0f);
     initialiseSmoother(amountSmoother, "amount", 0.01f);
     initialiseSmoother(mixSmoother, "mix", 0.01f);
+    initialiseSmoother(bypassSmoother, "bypass", 1.0f);
     waveformHistory.clear();
     triggeredWaveform.clear();
 
@@ -186,6 +188,7 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     outputDbSmoother.setTargetValue(outputDb);
     amountSmoother.setTargetValue(amount);
     mixSmoother.setTargetValue(mix);
+    bypassSmoother.setTargetValue(apvts.getRawParameterValue("bypass")->load(std::memory_order_relaxed));
 
     auto bassBuffer = getBusBuffer(buffer, true, 0);
     auto kickBuffer = getBusBuffer(buffer, true, 1);
@@ -230,8 +233,7 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         : static_cast<int>(apvts.getRawParameterValue("triggerMode")->load());
     const int division = juce::jlimit(0, 4, static_cast<int>(apvts.getRawParameterValue("cycleDivision")->load()));
     constexpr double divisions[] {0.25, 0.5, 1.0, 2.0, 4.0};
-    // Keep the saved experimental division only for legacy routing states.
-    const double cycleBeats = automaticRouting ? 1.0 : divisions[division];
+    const double cycleBeats = divisions[division];
     const bool bpmMode = triggerMode == 2 || (triggerMode == 0 && !hasKick);
     bool transportPlaying = false;
     double bpm = 120.0;
@@ -340,6 +342,7 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         if (samplesSinceTrigger < retriggerHoldSamples)
             ++samplesSinceTrigger;
 
+        const float active = 1.0f - bypassSmoother.getNextValue();
         const float inputGain = dbToLinear(inputDbSmoother.getNextValue());
         const float outputGain = dbToLinear(outputDbSmoother.getNextValue());
         const float sampleAmount = amountSmoother.getNextValue();
@@ -363,40 +366,46 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
             smoothedReduction += juce::jlimit(-step, step, targetReduction - smoothedReduction);
         const float reduction = smoothedReduction;
         const float duck = 1.0f - reduction;
-        blockGainReduction = std::max(blockGainReduction, reduction * sampleMix);
+        blockGainReduction = std::max(blockGainReduction, reduction * sampleMix * active);
 
         double inputPower = 0.0, outputPower = 0.0;
         float displayBassIn = 0.0f, displayBassOut = 0.0f;
 
         if (bassChannels == 1)
         {
-            const float dry = bassBuffer.getSample(0, sample) * inputGain;
-            const float output = dry * ((1.0f - sampleMix) + duck * sampleMix) * outputGain;
+            const float raw = bassBuffer.getSample(0, sample);
+            const float dry = raw * inputGain;
+            const float processed = dry * ((1.0f - sampleMix) + duck * sampleMix) * outputGain;
+            const float output = active == 1.0f ? processed : raw + (processed - raw) * active;
+            const float meteredInput = active == 1.0f ? dry : raw + (dry - raw) * active;
             bassBuffer.setSample(0, sample, output);
-            inputPower = static_cast<double>(dry) * dry;
+            inputPower = static_cast<double>(meteredInput) * meteredInput;
             outputPower = static_cast<double>(output) * output;
-            displayBassIn = dry;
+            displayBassIn = meteredInput;
             displayBassOut = output;
         }
         else
         {
-            const float dryL = bassBuffer.getSample(0, sample) * inputGain;
-            const float dryR = bassBuffer.getSample(1, sample) * inputGain;
+            const float rawL = bassBuffer.getSample(0, sample), rawR = bassBuffer.getSample(1, sample);
+            const float dryL = rawL * inputGain, dryR = rawR * inputGain;
             const float wetGain = (1.0f - sampleMix) + duck * sampleMix;
-            const float outputL = dryL * wetGain * outputGain;
-            const float outputR = dryR * wetGain * outputGain;
+            const float processedL = dryL * wetGain * outputGain, processedR = dryR * wetGain * outputGain;
+            const float outputL = active == 1.0f ? processedL : rawL + (processedL - rawL) * active;
+            const float outputR = active == 1.0f ? processedR : rawR + (processedR - rawR) * active;
+            const float inputL = active == 1.0f ? dryL : rawL + (dryL - rawL) * active;
+            const float inputR = active == 1.0f ? dryR : rawR + (dryR - rawR) * active;
             bassBuffer.setSample(0, sample, outputL);
             bassBuffer.setSample(1, sample, outputR);
-            inputPower = (static_cast<double>(dryL) * dryL + static_cast<double>(dryR) * dryR) * 0.5;
+            inputPower = (static_cast<double>(inputL) * inputL + static_cast<double>(inputR) * inputR) * 0.5;
             outputPower = (static_cast<double>(outputL) * outputL + static_cast<double>(outputR) * outputR) * 0.5;
             const bool useLeft = std::abs(dryL) >= std::abs(dryR);
-            displayBassIn = useLeft ? dryL : dryR;
+            displayBassIn = useLeft ? inputL : inputR;
             displayBassOut = useLeft ? outputL : outputR;
         }
 
         inputMeter.push(std::abs(displayBassIn), inputPower);
         outputMeter.push(std::abs(displayBassOut), outputPower);
-        const double actualReduction = reduction * sampleMix;
+        const double actualReduction = reduction * sampleMix * active;
         displayedReduction = actualReduction >= displayedReduction ? actualReduction
             : actualReduction + reductionMeterDecay * (displayedReduction - actualReduction);
 
@@ -405,10 +414,10 @@ void KickDuck1AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         const float displayKick = kickChannels == 2
             && std::abs(kickBuffer.getSample(1, sample)) > std::abs(kickBuffer.getSample(0, sample))
                 ? kickBuffer.getSample(1, sample) : (hasKick ? kickBuffer.getSample(0, sample) : 0.0f);
-        waveformHistory.push(displayBassIn, displayBassOut, displayKick, reduction * sampleMix);
+        waveformHistory.push(displayBassIn, displayBassOut, displayKick, reduction * sampleMix * active);
         triggeredWaveform.push(displayBassIn, displayBassOut, displayKick,
             static_cast<int>(juce::jlimit(1.0, 2147483647.0, std::round(windowSeconds * sr))), windowSeconds);
-        currentDuck.store(reduction, std::memory_order_relaxed);
+        currentDuck.store(reduction * active, std::memory_order_relaxed);
         currentPhase.store(static_cast<float>(phase), std::memory_order_relaxed);
         if (duckCycleActive)
         {
@@ -553,7 +562,7 @@ bool KickDuck1AudioProcessor::tryCopyCurvePoints(
 void KickDuck1AudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
-    state.setProperty("stateVersion", 7, nullptr);
+    state.setProperty("stateVersion", 8, nullptr);
     state.setProperty("curveRounded", isCurveRounded(), nullptr);
     for (auto oldCurve = state.getChildWithName("DuckingCurve"); oldCurve.isValid();
          oldCurve = state.getChildWithName("DuckingCurve"))
@@ -609,7 +618,7 @@ void KickDuck1AudioProcessor::setStateInformation(const void* data, int sizeInBy
         parameterState.setProperty("value", 0.0f, nullptr);
         state.addChild(parameterState, -1, nullptr);
     }
-    for (const auto* id : {"triggerMode", "cycleDivision", "automaticRouting"})
+    for (const auto* id : {"triggerMode", "cycleDivision", "automaticRouting", "bypass"})
     {
         bool found = false;
         for (const auto& child : state) found = found || child.getProperty("id").toString() == id;
@@ -620,6 +629,19 @@ void KickDuck1AudioProcessor::setStateInformation(const void* data, int sizeInBy
             parameterState.setProperty("value", juce::String(id) == "cycleDivision" ? 2 : 0, nullptr);
             state.addChild(parameterState, -1, nullptr);
         }
+    }
+    // v7 automatic routing ignored Cycle Division. Preserve its effective
+    // quarter-note cycle before making divisions available again.
+    if (version == 7)
+    {
+        bool automatic = false;
+        for (const auto& child : state)
+            if (child.getProperty("id").toString() == "automaticRouting")
+                automatic = static_cast<float>(child.getProperty("value")) > 0.5f;
+        if (automatic)
+            for (auto child : state)
+                if (child.getProperty("id").toString() == "cycleDivision")
+                    child.setProperty("value", 2.0f, nullptr);
     }
     apvts.replaceState(state);
     if (version < 2 && points.size() >= 3)

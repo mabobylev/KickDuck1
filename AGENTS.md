@@ -12,8 +12,8 @@
 `Source/PluginProcessor.*` — DSP, APVTS и состояние; `Source/PluginEditor.*` —
 GUI; `DuckingCurve.h` — общая геометрия кривой; `WaveformHistory.h` — история
 аудио. `Tests/ProcessorTests.cpp` — регрессионные проверки. `docs/` — решения
-и план. `build-dev/` — актуальная сборка; старый `build/` содержит устаревший
-CMake-кэш, но также локальный исходный JUCE.
+и план. `build-dev/` — актуальная сборка; `build/_deps/juce-src` содержит
+локальный исходный JUCE для offline-сборки.
 
 ## Сборка и проверки
 
