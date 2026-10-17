@@ -69,21 +69,21 @@ def main():
     epoch = int(os.environ.get("SOURCE_DATE_EPOCH", command("git", "show", "-s", "--format=%ct", "HEAD")))
     package_name = f"KickDuck1-{version}-linux-x86_64"
     output.mkdir(parents=True, exist_ok=True)
-    archive = output / f"{package_name}.tar.gz"
     with tempfile.TemporaryDirectory(prefix="kickduck-release-") as scratch:
         package = Path(scratch) / package_name
         package.mkdir()
         shutil.copytree(bundle, package / "KickDuck1.vst3")
         (package / "Standalone").mkdir()
         shutil.copy2(standalone, package / "Standalone/KickDuck1")
-        for name in ("README.md", "CHANGELOG.md"):
+        for name in ("README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"):
             shutil.copy2(ROOT / name, package / name)
+        shutil.copytree(ROOT / "LICENSES", package / "LICENSES")
         (package / "docs").mkdir()
+        shutil.copytree(ROOT / "docs/images", package / "docs/images")
         for name in ("INSTALL.md", "USER_GUIDE.md", "DISTRIBUTION.md", "REALTIME_AUDIT.md", "CONTROL_SEMANTICS.md", "CONTEXT.md", "PLAN.md"):
             shutil.copy2(ROOT / "docs" / name, package / "docs" / name)
         notices = [juce / "LICENSE.md"]
-        # Preserve upstream notices, including SDK alternatives; this does not
-        # choose a licence for the author's application.
+        # Preserve upstream notices, including the selected GPLv3 SDK option.
         for directory in (juce / "modules").iterdir():
             if not directory.is_dir():
                 continue
@@ -96,15 +96,27 @@ def main():
             target = package / "THIRD_PARTY/JUCE" / source.relative_to(juce)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
-        (package / "THIRD_PARTY_NOTICES.md").write_text(
-            "# Third-party notices\n\nJUCE and bundled dependency notices are preserved under THIRD_PARTY/JUCE.\n"
-            "These files do not select a licence for KickDuck1. See docs/DISTRIBUTION.md.\n",
-            encoding="utf-8")
+        source_name = f"KickDuck1-{version}-source"
+        source = Path(scratch) / source_name
+        source.mkdir()
+        # Only tracked files belong in the source distribution. Stage new files first.
+        files = command("git", "ls-files", "--cached", "-z").split("\0")
+        for name in sorted(set(files)):
+            if not name:
+                continue
+            target = source / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / name, target)
+        if not (source / "LICENSE").is_file() or not (source / "docs/images").is_dir():
+            parser.error("Stage the licence and documentation assets before packaging.")
+        shutil.copytree(juce, source / "build/_deps/juce-src",
+                        ignore=shutil.ignore_patterns(".git"))
         info = {
             "product": "KickDuck1", "version": version, "platform": "linux-x86_64",
             "gitRevision": revision,
             "workingTreeDirty": bool(command("git", "status", "--porcelain", "--untracked-files=no")),
-            "projectLicence": "unspecified", "publicReleasePublished": False,
+            "projectLicence": "AGPL-3.0-only", "publicReleasePublished": False,
+            "correspondingSource": f"{source_name}.tar.gz",
             "binaries": {
                 "KickDuck1.vst3/Contents/x86_64-linux/KickDuck1.so": binary_info(plugin),
                 "Standalone/KickDuck1": binary_info(standalone),
@@ -121,13 +133,16 @@ def main():
             member.mtime = epoch
             return member
 
-        with archive.open("wb") as raw:
-            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=epoch) as compressed:
-                with tarfile.open(fileobj=compressed, mode="w") as tar:
-                    tar.add(package, arcname=package_name, filter=metadata)
-    archive.with_name(archive.name + ".sha256").write_text(f"{digest(archive)}  {archive.name}\n", encoding="utf-8")
-    print(archive)
-    print("Package prepared locally. No GitHub release/tag was published; project licence is unspecified.")
+        for directory in (package, source):
+            destination = output / f"{directory.name}.tar.gz"
+            with destination.open("wb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=epoch) as compressed:
+                    with tarfile.open(fileobj=compressed, mode="w") as tar:
+                        tar.add(directory, arcname=directory.name, filter=metadata)
+            destination.with_name(destination.name + ".sha256").write_text(
+                f"{digest(destination)}  {destination.name}\n", encoding="utf-8")
+            print(destination)
+    print("AGPLv3 packages prepared locally. No GitHub release/tag was published.")
 
 
 if __name__ == "__main__":
