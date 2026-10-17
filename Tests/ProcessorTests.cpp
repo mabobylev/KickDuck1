@@ -933,7 +933,7 @@ void editorLayoutPreviewsTest()
         require(p->apvts.getRawParameterValue("cycleDivision")->load() == divisionIndex++, "Division button did not update parameter");
     }
     dynamic_cast<juce::TextButton*>(namedChild(*editor, "Division 1/4"))->onClick();
-    for (auto size : {juce::Point<int>{1050, 620}, {1260, 800}, {1800, 1100}, {1050, 1100}, {1800, 680}})
+    for (auto size : {juce::Point<int>{1050, 620}, {1050, 700}, {1260, 800}, {1800, 1100}, {1050, 1100}, {1800, 680}})
     {
         editor->setSize(size.x, size.y);
         juce::Thread::sleep(100);
@@ -1178,7 +1178,7 @@ void startupClassicPresetTest()
         p->getStateInformation(before);
         auto editor = std::unique_ptr<juce::AudioProcessorEditor>(p->createEditor());
         auto* classic = dynamic_cast<juce::Button*>(namedChild(*editor, "Curve preset: Classic"));
-        require(editor->getWidth() == 1050 && editor->getHeight() == 620, "Editor did not start at minimum size");
+        require(editor->getWidth() == 1050 && editor->getHeight() == 700, "Editor did not start at the recommended size");
         require(classic->getToggleState(), "Classic is not highlighted immediately at host tempo");
         p->getStateInformation(after);
         require(before == after && !p->canUndoEdit(), "Startup highlight changed saved settings/history");

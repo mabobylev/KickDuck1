@@ -189,7 +189,7 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
       processor(p)
 {
     processor.registerEditorThread();
-    setSize(1050, 620);
+    setSize(1050, 700);
     setResizable(true, true);
     setResizeLimits(1050, 620, 1800, 1100);
 
