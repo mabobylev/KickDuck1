@@ -9,11 +9,12 @@
 #include <atomic>
 #include <vector>
 
-class KickDuck1AudioProcessor : public juce::AudioProcessor
+class KickDuck1AudioProcessor : public juce::AudioProcessor,
+                                private juce::AudioProcessorParameter::Listener
 {
 public:
     KickDuck1AudioProcessor();
-    ~KickDuck1AudioProcessor() override = default;
+    ~KickDuck1AudioProcessor() override;
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
@@ -73,12 +74,47 @@ public:
     void setCurvePoints(const std::vector<DuckingCurve::Point>& points);
     void editCurvePoints(const std::vector<DuckingCurve::Point>& effectivePoints);
     void resetCurve();
+    double getPresetReferenceSeconds() const noexcept { return presetReferenceSeconds.load(std::memory_order_relaxed); }
     bool isCurveRounded() const noexcept { return curveRounded.load(std::memory_order_relaxed); }
     void setCurveRounded(bool rounded);
     void applyCurvePreset(DuckingCurve::Preset preset);
     bool tryCopyCurvePoints(std::vector<DuckingCurve::Point>& points) const;
 
+    // Control/message thread edits only. No history work in the audio callback.
+    void registerEditorThread() noexcept;
+    void beginUserEdit();
+    void endUserEdit();
+    void finishUserEdits();
+    void selectCompareSlot(int slot);
+    void copyCompareSlot();
+    int getCompareSlot() const;
+    bool canUndoEdit() const;
+    bool canRedoEdit() const;
+    void undoEdit();
+    void redoEdit();
+    juce::Result savePresetFile(const juce::File&) const;
+    juce::Result loadPresetFile(const juce::File&);
+
 private:
+    struct Edit { juce::ValueTree before, after; };
+    struct CompareSlot
+    {
+        juce::ValueTree settings;
+        std::vector<Edit> undo, redo;
+    };
+    std::atomic<juce::Thread::ThreadID> editThreadId {};
+    mutable std::recursive_mutex editMutex;
+    std::array<CompareSlot, 2> compareSlots;
+    int compareSlot = 0, editDepth = 0;
+    bool replayingEdit = false;
+    juce::ValueTree editBefore;
+    juce::ValueTree captureSettings() const;
+    void applySettings(const juce::ValueTree&, const juce::ValueTree& baseline = {}, bool keepBypass = false);
+    void restoreCompareState(const juce::ValueTree&);
+    void parameterValueChanged(int, float) override {}
+    void parameterGestureChanged(int, bool starting) override;
+
+    static_assert(std::atomic<juce::Thread::ThreadID>::is_always_lock_free, "GUI gesture routing must be lock-free");
     static_assert(std::atomic<float>::is_always_lock_free, "DSP meters must be lock-free");
     static_assert(std::atomic<double>::is_always_lock_free, "Timing snapshots must be lock-free");
     static_assert(std::atomic<int>::is_always_lock_free, "Curve ownership must be lock-free");
@@ -134,6 +170,7 @@ private:
     std::array<DuckingCurve::Point, maxCurvePoints> audioCurveCache {};
     int audioCurveCacheCount = 2;
 
+    std::atomic<double> presetReferenceSeconds {0.5};
     std::atomic<bool> curveRounded {true};
     DuckingCurve duckingCurve; // GUI/state-thread only; never touched by audio.
     WaveformHistory waveformHistory;

@@ -45,7 +45,7 @@ void KickDuck1AudioProcessorEditor::CompactButton::paintButton(
     g.fillRoundedRectangle(box, 5.0f);
     g.setColour(selected ? curveColour : gridBright);
     g.drawRoundedRectangle(box, 5.0f, 1.0f);
-    g.setColour(selected || highlighted ? curveColour : ::text);
+    g.setColour(!isEnabled() ? muted.withAlpha(0.45f) : (selected || highlighted ? curveColour : ::text));
     g.setFont(font(10.5f, true));
     g.drawText(getButtonText(), getLocalBounds().reduced(3, 0), juce::Justification::centred);
 }
@@ -188,16 +188,19 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
     : AudioProcessorEditor(&p),
       processor(p)
 {
-    setSize(1260, 800);
+    processor.registerEditorThread();
+    setSize(1050, 620);
     setResizable(true, true);
-    setResizeLimits(1050, 680, 1800, 1100);
+    setResizeLimits(1050, 620, 1800, 1100);
 
     curveEditor.setPoints(processor.getCurvePoints());
 
     curveEditor.onPointsChanged =
         [this](const std::vector<DuckingCurve::Point>& points)
         {
+            processor.beginUserEdit();
             processor.editCurvePoints(points);
+            processor.endUserEdit();
             curveEditor.setAmount(processor.apvts.getRawParameterValue("amount")->load() * 0.01f);
             curveEditor.setControls(processor.apvts.getRawParameterValue("length")->load(),
                                     processor.apvts.getRawParameterValue("attack")->load(),
@@ -206,12 +209,39 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
             curveEditor.setPoints(processor.getCurvePoints());
         };
 
+    curveEditor.onEditStarted = [this] { processor.beginUserEdit(); };
+    curveEditor.onEditFinished = [this] { processor.endUserEdit(); };
+    for (auto* button : {&compareAButton, &compareBButton, &copyCompareButton, &undoButton, &redoButton})
+    {
+        button->setName(button->getButtonText());
+        addAndMakeVisible(*button);
+    }
+    compareAButton.setTooltip("Compare settings A. Each bank has its own undo history; Bypass is shared.");
+    compareBButton.setTooltip("Compare settings B. On first use B starts from A.");
+    copyCompareButton.setTooltip("Copy current settings to the other bank. Replaces its settings and clears its undo history.");
+    undoButton.setTooltip("Undo the last edit in the selected bank (up to 64). Host automation is not recorded.");
+    redoButton.setTooltip("Redo the last undone edit in the selected bank.");
+    compareAButton.onClick = [this] { processor.selectCompareSlot(0); updateMeters(); };
+    compareBButton.onClick = [this] { processor.selectCompareSlot(1); updateMeters(); };
+    copyCompareButton.onClick = [this] { processor.copyCompareSlot(); updateMeters(); };
+    undoButton.onClick = [this] { processor.undoEdit(); updateMeters(); };
+    redoButton.onClick = [this] { processor.redoEdit(); updateMeters(); };
+    savePresetButton.setName("Save full preset");
+    loadPresetButton.setName("Load full preset");
+    savePresetButton.setTooltip("Save all current parameters and the curve to a .kickduckpreset file.");
+    loadPresetButton.setTooltip("Load a full preset into the selected A/B bank. Undo restores the previous settings.");
+    addAndMakeVisible(savePresetButton);
+    addAndMakeVisible(loadPresetButton);
+    savePresetButton.onClick = [this] { choosePresetFile(true); };
+    loadPresetButton.onClick = [this] { choosePresetFile(false); };
     curveEditor.setName("Ducking curve");
     addAndMakeVisible(curveEditor);
     addAndMakeVisible(signalScope);
     resetCurveButton.onClick = [this]
     {
+        processor.beginUserEdit();
         processor.resetCurve();
+        processor.endUserEdit();
         updateMeters();
         curveEditor.setPoints(processor.getCurvePoints());
     };
@@ -312,6 +342,7 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
         button.setColour(juce::TextButton::buttonOnColourId, curveColour.withAlpha(0.3f));
         button.onClick = [this, i]
         {
+            processor.beginUserEdit();
             const auto set = [this](const char* id, float value)
             {
                 auto* p = processor.apvts.getParameter(id);
@@ -322,6 +353,7 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
             // Set the explicit mode before disabling automatic routing.
             if (i != 0) set("triggerMode", static_cast<float>(i));
             set("automaticRouting", i == 0 ? 1.0f : 0.0f);
+            processor.endUserEdit();
             updateMeters();
         };
         addAndMakeVisible(button);
@@ -354,7 +386,9 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
         button = std::make_unique<CurvePresetButton>(preset);
         button->onClick = [this, preset]
         {
+            processor.beginUserEdit();
             processor.applyCurvePreset(preset);
+            processor.endUserEdit();
             processor.tryCopyCurvePoints(curveSnapshot);
             curveEditor.setPoints(curveSnapshot);
             updateMeters();
@@ -372,6 +406,49 @@ KickDuck1AudioProcessorEditor::KickDuck1AudioProcessorEditor(
 KickDuck1AudioProcessorEditor::~KickDuck1AudioProcessorEditor()
 {
     stopTimer();
+    processor.finishUserEdits();
+}
+
+void KickDuck1AudioProcessorEditor::choosePresetFile(bool save)
+{
+    if (presetDialogOpen) return;
+    presetDialogOpen = true;
+    savePresetButton.setEnabled(false);
+    loadPresetButton.setEnabled(false);
+    const auto initial = juce::File::getSpecialLocation(juce::File::userDocumentsDirectory)
+        .getChildFile(save ? "KickDuck1.kickduckpreset" : "");
+    presetChooser = std::make_unique<juce::FileChooser>(save ? "Save KickDuck1 preset" : "Load KickDuck1 preset",
+                                                      initial, "*.kickduckpreset");
+    const int flags = juce::FileBrowserComponent::canSelectFiles
+        | (save ? juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting
+                : juce::FileBrowserComponent::openMode);
+    const juce::Component::SafePointer<KickDuck1AudioProcessorEditor> safe(this);
+    presetChooser->launchAsync(flags, [safe, save](const juce::FileChooser& chooser)
+    {
+        if (safe == nullptr) return;
+        const auto file = chooser.getResult();
+        if (file != juce::File())
+        {
+            const auto target = save ? file.withFileExtension("kickduckpreset") : file;
+            // The chooser confirmed overwriting the selected path, not a
+            // different existing file produced by appending our extension.
+            const auto result = save && target != file && target.existsAsFile()
+                ? juce::Result::fail("That preset already exists. Select its full .kickduckpreset filename to confirm replacement.")
+                : (save ? safe->processor.savePresetFile(target) : safe->processor.loadPresetFile(file));
+            if (result.failed())
+                juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+                                                       "KickDuck1 preset", result.getErrorMessage());
+            else
+            {
+                safe->processor.tryCopyCurvePoints(safe->curveSnapshot);
+                safe->curveEditor.setPoints(safe->curveSnapshot);
+                safe->updateMeters();
+            }
+        }
+        safe->presetDialogOpen = false;
+        safe->savePresetButton.setEnabled(true);
+        safe->loadPresetButton.setEnabled(true);
+    });
 }
 
 void KickDuck1AudioProcessorEditor::setupKnob(
@@ -597,19 +674,25 @@ void KickDuck1AudioProcessorEditor::paint(juce::Graphics& g)
     controlPanel(layout.shape, "CURVE TIMING", muted);
     controlPanel(layout.gains, "SIGNAL LEVELS", bassOutColour);
     controlPanel(layout.amount, "DUCKING DEPTH", curveColour);
+    controlPanel(layout.modes, "TRIGGER", muted);
+    controlPanel(layout.divisions, "CYCLE", muted);
+    controlPanel(layout.compare, "COMPARE", curveColour);
+    controlPanel(layout.history, "HISTORY", muted);
+    controlPanel(layout.files, "FULL PRESET", curveColour);
+    controlPanel(layout.bypass, "PROCESS", muted);
 }
 
 void KickDuck1AudioProcessorEditor::resized()
 {
     resetCurveButton.setBounds(getWidth() - 120, 24, 98, 25);
     signalScope.setBounds(300, 14, getWidth() - 610, 50);
-    auto content = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(210).reduced(18, 0);
+    auto content = getLocalBounds().withTrimmedTop(82).withTrimmedBottom(242).reduced(18, 0);
     layout.meters = content.removeFromRight(320);
     content.removeFromRight(10);
     layout.graph = content;
     curveEditor.setBounds(layout.graph);
 
-    auto controls = getLocalBounds().removeFromBottom(196).reduced(18, 7);
+    auto controls = getLocalBounds().withTrimmedBottom(66).removeFromBottom(164).reduced(18, 7);
     layout.amount = controls.removeFromRight(180);
     controls.removeFromRight(8);
     layout.gains = controls.removeFromRight(200);
@@ -623,19 +706,40 @@ void KickDuck1AudioProcessorEditor::resized()
         label.setBounds(cell.removeFromTop(20));
         slider.setBounds(cell.reduced(2, 0));
     };
-    auto launch = layout.shape.withTrimmedTop(132).reduced(8, 0);
-    const int launchWidth = std::min(320, launch.getWidth());
-    launch = launch.withSizeKeepingCentre(launchWidth, launch.getHeight());
-    auto modes = launch.removeFromTop(20);
-    const int modeWidth = modes.getWidth() / 4;
-    for (auto& button : modeButtons)
-        button.setBounds(modes.removeFromLeft(modeWidth).reduced(2, 0));
-    bypassButton.setBounds(modes.reduced(2, 0));
-    launch.removeFromTop(4);
-    auto divisions = launch.removeFromTop(20);
+    auto footer = getLocalBounds().removeFromBottom(60).reduced(18, 5);
+    const int footerGap = 7;
+    const int available = footer.getWidth() - footerGap * 5;
+    const auto group = [&](int weight)
+    {
+        auto bounds = footer.removeFromLeft(available * weight / 1000);
+        footer.removeFromLeft(footerGap);
+        return bounds;
+    };
+    layout.modes = group(205);
+    layout.divisions = group(245);
+    layout.compare = group(150);
+    layout.history = group(140);
+    layout.files = group(150);
+    layout.bypass = footer;
+    const auto row = [](juce::Rectangle<int> bounds) { return bounds.withTrimmedTop(27).reduced(6, 0).withHeight(22); };
+    auto modes = row(layout.modes);
+    modeButtons[0].setBounds(modes.removeFromLeft(modes.getWidth() / 4).reduced(2, 0));
+    modeButtons[1].setBounds(modes.removeFromLeft(modes.getWidth() / 3).reduced(2, 0));
+    modeButtons[2].setBounds(modes.reduced(2, 0));
+    auto divisions = row(layout.divisions);
     const int divisionWidth = divisions.getWidth() / 5;
-    for (auto& button : divisionButtons)
-        button.setBounds(divisions.removeFromLeft(divisionWidth).reduced(2, 0));
+    for (auto& button : divisionButtons) button.setBounds(divisions.removeFromLeft(divisionWidth).reduced(2, 0));
+    auto compare = row(layout.compare);
+    compareAButton.setBounds(compare.removeFromLeft(compare.getWidth() / 4).reduced(1, 0));
+    compareBButton.setBounds(compare.removeFromLeft(compare.getWidth() / 3).reduced(1, 0));
+    copyCompareButton.setBounds(compare.reduced(1, 0));
+    auto history = row(layout.history);
+    undoButton.setBounds(history.removeFromLeft(history.getWidth() / 2).reduced(2, 0));
+    redoButton.setBounds(history.reduced(2, 0));
+    auto files = row(layout.files);
+    savePresetButton.setBounds(files.removeFromLeft(files.getWidth() / 2).reduced(2, 0));
+    loadPresetButton.setBounds(files.reduced(2, 0));
+    bypassButton.setBounds(row(layout.bypass));
     auto shape = layout.shape.withTrimmedTop(28).reduced(4, 0);
     // Keep timing controls close together even in a wide editor.
     const int cellWidth = std::min(110, shape.getWidth() / 4);
@@ -650,7 +754,7 @@ void KickDuck1AudioProcessorEditor::resized()
     for (auto* slider : {&onsetAttackSlider, &lengthSlider, &attackSlider, &releaseSlider, &inputSlider, &outputSlider})
         slider->setBounds(slider->getBounds().withHeight(82));
     auto amount = layout.amount.withTrimmedTop(24).reduced(10, 0);
-    legacyMixButton.setBounds(amount.removeFromBottom(22).reduced(4, 1));
+    legacyMixButton.setBounds(amount.removeFromBottom(18).reduced(4, 1));
     place(amount, amountSlider, amountLabel);
     auto presets = layout.presets.withTrimmedTop(32).reduced(10, 0);
     const int gap = 6;
@@ -659,7 +763,7 @@ void KickDuck1AudioProcessorEditor::resized()
     {
         if (presetButtons[i])
             presetButtons[i]->setBounds(presets.getX() + (i % 3) * (width + gap),
-                                        presets.getY() + (i / 3) * 58, width, 50);
+                                        presets.getY() + (i / 3) * 46, width, 40);
     }
 }
 
@@ -734,7 +838,8 @@ void KickDuck1AudioProcessorEditor::drawMeter(
         // GR falls from the top towards the bottom.
         // The bar saturates at -24 dB; the numeric readout
         // continues to show the actual processor value.
-        for (int gr : { 0, -6, -12, -18, -24 })
+        const int step = bar.getHeight() < 80.0f ? 12 : 6;
+        for (int gr = 0; gr >= -24; gr -= step)
         {
             const float normalized =
                 static_cast<float>(-gr) / 24.0f;
@@ -753,7 +858,8 @@ void KickDuck1AudioProcessorEditor::drawMeter(
     }
     else
     {
-        for (int db : { 0, -12, -24, -36, -48, -60 })
+        const int step = bar.getHeight() < 100.0f ? 30 : 12;
+        for (int db = 0; db >= -60; db -= step)
         {
             const float normalized =
                 static_cast<float>(db + 60) / 60.0f;
@@ -833,6 +939,12 @@ void KickDuck1AudioProcessorEditor::timerCallback()
 
 void KickDuck1AudioProcessorEditor::updateMeters()
 {
+    const int bank = processor.getCompareSlot();
+    compareAButton.setToggleState(bank == 0, juce::dontSendNotification);
+    compareBButton.setToggleState(bank == 1, juce::dontSendNotification);
+    copyCompareButton.setButtonText(bank == 0 ? "A > B" : "B > A");
+    undoButton.setEnabled(processor.canUndoEdit());
+    redoButton.setEnabled(processor.canRedoEdit());
     const bool rounded = processor.isCurveRounded();
     curveEditor.setRounded(rounded);
     std::array<DuckingCurve::Point, DuckingCurve::maxPoints> effective {};
@@ -865,14 +977,23 @@ void KickDuck1AudioProcessorEditor::updateMeters()
         const double tailHigh = std::min(1000.0, (1.0 - effective[tail - 1].x - 0.002) * ms);
         limitKnob(attackSlider, tailLow, tailHigh, (1.0 - effective[tail].x) * ms, 0.01);
     }
+    // Match the preset's saved controls at its selection tempo. BPM changes
+    // affect the displayed curve, but are not edits to the chosen preset.
+    std::array<DuckingCurve::Point, DuckingCurve::maxPoints> presetGeometry {};
+    std::copy(curveSnapshot.begin(), curveSnapshot.end(), presetGeometry.begin());
+    DuckingCurve::applyControls(presetGeometry.data(), count,
+        processor.apvts.getRawParameterValue("length")->load(),
+        processor.apvts.getRawParameterValue("attack")->load(),
+        processor.apvts.getRawParameterValue("release")->load(), processor.getPresetReferenceSeconds(),
+        processor.apvts.getRawParameterValue("onsetAttack")->load());
     for (auto& button : presetButtons)
     {
         if (!button) continue;
         const auto& preset = button->getPoints();
         bool matches = rounded && count == static_cast<int>(preset.size());
         for (int i = 0; matches && i < count; ++i)
-            matches = std::abs(effective[i].x - preset[i].x) < 0.0005f
-                && std::abs(effective[i].y - preset[i].y) < 0.0005f;
+            matches = std::abs(presetGeometry[i].x - preset[i].x) < 0.0005f
+                && std::abs(presetGeometry[i].y - preset[i].y) < 0.0005f;
         button->setToggleState(matches, juce::dontSendNotification);
     }
     const float legacyMix = processor.apvts.getRawParameterValue("mix")->load();
@@ -1446,7 +1567,10 @@ void KickDuck1AudioProcessorEditor::CurveEditor::mouseDown(
     }
 
     if (selectedPoint >= 0)
+    {
+        if (onEditStarted) onEditStarted();
         dragging = true;
+    }
 }
 
 void KickDuck1AudioProcessorEditor::CurveEditor::mouseDrag(
@@ -1508,6 +1632,7 @@ void KickDuck1AudioProcessorEditor::CurveEditor::mouseDrag(
 void KickDuck1AudioProcessorEditor::CurveEditor::mouseUp(
     const juce::MouseEvent&)
 {
+    if (dragging && onEditFinished) onEditFinished();
     dragging = false;
 }
 

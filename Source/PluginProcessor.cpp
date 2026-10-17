@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include <cstdlib>
 
 namespace
 {
@@ -29,10 +30,21 @@ KickDuck1AudioProcessor::KickDuck1AudioProcessor()
       apvts(*this, nullptr, "PARAMETERS", createParameterLayout()),
       waveformHistory(524288)
 {
-    const auto points = duckingCurve.getPoints();
+    const auto points = DuckingCurve::presetPoints(DuckingCurve::Preset::classic);
+    duckingCurve.setPoints(points);
     audioCurveCacheCount = static_cast<int>(points.size());
     std::copy(points.begin(), points.end(), audioCurveCache.begin());
     publishCurve(points);
+    // May construct on a host worker. Only establish a known GUI thread here;
+    // createEditor registers it again when GUI becomes available.
+    if (auto* manager = juce::MessageManager::getInstanceWithoutCreating())
+        if (manager->isThisTheMessageThread()) registerEditorThread();
+    for (auto* parameter : getParameters()) parameter->addListener(this);
+}
+
+KickDuck1AudioProcessor::~KickDuck1AudioProcessor()
+{
+    for (auto* parameter : getParameters()) parameter->removeListener(this);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout
@@ -542,6 +554,7 @@ void KickDuck1AudioProcessor::setCurveRounded(bool rounded)
 
 void KickDuck1AudioProcessor::applyCurvePreset(DuckingCurve::Preset preset)
 {
+    presetReferenceSeconds.store(getCycleSeconds(), std::memory_order_relaxed);
     setCurveRounded(true);
     setCurveParameter(apvts, "onsetAttack", 0.0f);
     const auto points = DuckingCurve::presetPoints(preset);
@@ -559,11 +572,273 @@ bool KickDuck1AudioProcessor::tryCopyCurvePoints(
     return duckingCurve.tryCopyPoints(points);
 }
 
+juce::ValueTree KickDuck1AudioProcessor::captureSettings() const
+{
+    juce::ValueTree settings("Settings");
+    settings.setProperty("rounded", isCurveRounded(), nullptr);
+    settings.setProperty("presetReferenceSeconds", getPresetReferenceSeconds(), nullptr);
+    for (auto* parameter : getParameters())
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(parameter))
+        {
+            juce::ValueTree value("PARAM");
+            value.setProperty("id", ranged->paramID, nullptr);
+            value.setProperty("value", ranged->convertFrom0to1(ranged->getValue()), nullptr);
+            settings.addChild(value, -1, nullptr);
+        }
+    juce::ValueTree curve("Curve");
+    for (const auto& p : getCurvePoints())
+    {
+        juce::ValueTree point("Point");
+        point.setProperty("x", p.x, nullptr);
+        point.setProperty("y", p.y, nullptr);
+        curve.addChild(point, -1, nullptr);
+    }
+    settings.addChild(curve, -1, nullptr);
+    return settings;
+}
+
+void KickDuck1AudioProcessor::applySettings(const juce::ValueTree& settings,
+                                            const juce::ValueTree& baseline, bool keepBypass)
+{
+    if (!settings.hasType("Settings")) return;
+    const juce::ScopedValueSetter<bool> replay(replayingEdit, true);
+    for (auto* parameter : getParameters())
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(parameter))
+        {
+            if (keepBypass && ranged->paramID == "bypass") continue;
+            const auto value = settings.getChildWithProperty("id", ranged->paramID);
+            const auto previous = baseline.getChildWithProperty("id", ranged->paramID);
+            if (!value.isValid() || (baseline.isValid() && value.isEquivalentTo(previous))) continue;
+            const float physical = static_cast<float>(value.getProperty("value"));
+            if (!std::isfinite(physical)) continue;
+            const float normalized = ranged->convertTo0to1(physical);
+            if (std::abs(normalized - ranged->getValue()) < 1.0e-7f) continue;
+            ranged->beginChangeGesture();
+            ranged->setValueNotifyingHost(normalized);
+            ranged->endChangeGesture();
+        }
+    if (!baseline.isValid() || settings.getProperty("rounded") != baseline.getProperty("rounded"))
+        curveRounded.store(static_cast<bool>(settings.getProperty("rounded", true)), std::memory_order_relaxed);
+    if (!baseline.isValid() || settings.getProperty("presetReferenceSeconds") != baseline.getProperty("presetReferenceSeconds"))
+    {
+        const double seconds = settings.getProperty("presetReferenceSeconds", 0.5);
+        presetReferenceSeconds.store(std::isfinite(seconds) && seconds > 0 ? seconds : 0.5, std::memory_order_relaxed);
+    }
+    const auto curve = settings.getChildWithName("Curve");
+    if (curve.isValid() && (!baseline.isValid() || !curve.isEquivalentTo(baseline.getChildWithName("Curve"))))
+    {
+        std::vector<DuckingCurve::Point> points;
+        for (int i = 0; i < std::min(maxCurvePoints, curve.getNumChildren()); ++i)
+            points.push_back({static_cast<float>(curve.getChild(i).getProperty("x")),
+                              static_cast<float>(curve.getChild(i).getProperty("y"))});
+        setCurvePoints(points);
+    }
+    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
+}
+
+void KickDuck1AudioProcessor::parameterGestureChanged(int, bool starting)
+{
+    // Hosts may send gestures from the audio thread. Never capture history there.
+    // Do not call MessageManager::isThisTheMessageThread here: JUCE 8 takes
+    // a mutex there. An atomic cached ID keeps non-GUI callbacks lock-free.
+    if (editThreadId.load(std::memory_order_relaxed) != juce::Thread::getCurrentThreadId()) return;
+    if (starting) beginUserEdit(); else endUserEdit();
+}
+
+void KickDuck1AudioProcessor::registerEditorThread() noexcept
+{
+    editThreadId.store(juce::Thread::getCurrentThreadId(), std::memory_order_relaxed);
+}
+
+void KickDuck1AudioProcessor::beginUserEdit()
+{
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    if (replayingEdit) return;
+    if (editDepth++ == 0) editBefore = captureSettings();
+}
+
+void KickDuck1AudioProcessor::endUserEdit()
+{
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    if (replayingEdit || editDepth == 0) return;
+    if (--editDepth != 0) return;
+    auto after = captureSettings();
+    if (!editBefore.isEquivalentTo(after))
+    {
+        auto& slot = compareSlots[compareSlot];
+        if (slot.undo.size() >= 64) slot.undo.erase(slot.undo.begin());
+        slot.undo.push_back({editBefore, after});
+        slot.redo.clear();
+    }
+    editBefore = {};
+}
+
+void KickDuck1AudioProcessor::finishUserEdits()
+{
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    if (editDepth == 0) return;
+    editDepth = 1;
+    endUserEdit();
+}
+
+int KickDuck1AudioProcessor::getCompareSlot() const
+{
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    return compareSlot;
+}
+
+void KickDuck1AudioProcessor::selectCompareSlot(int slot)
+{
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    if (slot < 0 || slot > 1 || slot == compareSlot || editDepth != 0) return;
+    auto current = captureSettings();
+    compareSlots[compareSlot].settings = current;
+    if (!compareSlots[slot].settings.isValid()) compareSlots[slot].settings = current.createCopy();
+    compareSlot = slot;
+    applySettings(compareSlots[slot].settings, {}, true);
+}
+
+void KickDuck1AudioProcessor::copyCompareSlot()
+{
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    if (editDepth != 0) return;
+    auto& other = compareSlots[1 - compareSlot];
+    other.settings = captureSettings();
+    other.undo.clear();
+    other.redo.clear();
+    updateHostDisplay(juce::AudioProcessor::ChangeDetails().withNonParameterStateChanged(true));
+}
+
+bool KickDuck1AudioProcessor::canUndoEdit() const
+{
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    return editDepth == 0 && !compareSlots[compareSlot].undo.empty();
+}
+
+bool KickDuck1AudioProcessor::canRedoEdit() const
+{
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    return editDepth == 0 && !compareSlots[compareSlot].redo.empty();
+}
+
+void KickDuck1AudioProcessor::undoEdit()
+{
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    if (!canUndoEdit()) return;
+    auto& slot = compareSlots[compareSlot];
+    auto edit = slot.undo.back();
+    slot.undo.pop_back();
+    applySettings(edit.before, edit.after);
+    slot.redo.push_back(edit);
+}
+
+void KickDuck1AudioProcessor::redoEdit()
+{
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    if (!canRedoEdit()) return;
+    auto& slot = compareSlots[compareSlot];
+    auto edit = slot.redo.back();
+    slot.redo.pop_back();
+    applySettings(edit.after, edit.before);
+    slot.undo.push_back(edit);
+}
+
+juce::Result KickDuck1AudioProcessor::savePresetFile(const juce::File& file) const
+{
+    juce::ValueTree preset("KickDuck1Preset");
+    preset.setProperty("formatVersion", 1, nullptr);
+    {
+        std::lock_guard<std::recursive_mutex> lock(editMutex);
+        preset.addChild(captureSettings(), -1, nullptr);
+    }
+    const auto xml = preset.createXml();
+    if (xml == nullptr) return juce::Result::fail("Could not serialize the preset.");
+    juce::TemporaryFile temporary(file);
+    if (!temporary.getFile().replaceWithText(xml->toString(), false, false, "\n")
+        || !temporary.overwriteTargetFileWithTemporary())
+        return juce::Result::fail("Could not save the preset. Check the folder and file permissions.");
+    return juce::Result::ok();
+}
+
+juce::Result KickDuck1AudioProcessor::loadPresetFile(const juce::File& file)
+{
+    const auto invalid = [] { return juce::Result::fail("Invalid or unsupported KickDuck1 preset. Settings were not changed."); };
+    if (!file.existsAsFile() || file.getSize() > 1024 * 1024) return invalid();
+    const auto xml = juce::XmlDocument::parse(file);
+    if (xml == nullptr || !xml->hasTagName("KickDuck1Preset")) return invalid();
+    const auto preset = juce::ValueTree::fromXml(*xml);
+    if (preset.getProperty("formatVersion").toString() != "1" || preset.getNumChildren() != 1) return invalid();
+    const auto settings = preset.getChildWithName("Settings");
+    if (!settings.isValid() || settings.getNumChildren() != getParameters().size() + 1) return invalid();
+    const auto number = [](const juce::var& value, double& result)
+    {
+        const auto string = value.toString().trim();
+        if (string.isEmpty()) return false;
+        const auto* text = string.toRawUTF8();
+        char* end = nullptr;
+        result = std::strtod(text, &end);
+        return end != text && *end == 0 && std::isfinite(result);
+    };
+    for (auto* parameter : getParameters())
+        if (auto* ranged = dynamic_cast<juce::RangedAudioParameter*>(parameter))
+        {
+            int matches = 0;
+            for (const auto& child : settings)
+                if (child.hasType("PARAM") && child.getProperty("id").toString() == ranged->paramID) ++matches;
+            double value = 0;
+            const auto parameterState = settings.getChildWithProperty("id", ranged->paramID);
+            const auto& range = ranged->getNormalisableRange();
+            if (matches != 1 || !number(parameterState.getProperty("value"), value)
+                || value < range.start || value > range.end) return invalid();
+        }
+    if (settings.hasProperty("presetReferenceSeconds"))
+    {
+        double reference = 0;
+        if (!number(settings.getProperty("presetReferenceSeconds"), reference) || reference <= 0) return invalid();
+    }
+    const auto rounded = settings.getProperty("rounded").toString();
+    if (rounded != "0" && rounded != "1") return invalid();
+    const auto curve = settings.getChildWithName("Curve");
+    if (!curve.isValid() || curve.getNumChildren() < 2 || curve.getNumChildren() > maxCurvePoints) return invalid();
+    double previousX = -1;
+    for (int i = 0; i < curve.getNumChildren(); ++i)
+    {
+        const auto point = curve.getChild(i);
+        double x = 0, y = 0;
+        if (!point.hasType("Point") || !number(point.getProperty("x"), x) || !number(point.getProperty("y"), y)
+            || x < 0 || x > 1 || y < 0 || y > 1 || x <= previousX
+            || (i == 0 && x != 0) || (i == curve.getNumChildren() - 1 && x != 1)) return invalid();
+        previousX = x;
+    }
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    if (editDepth != 0) return juce::Result::fail("Finish the current edit before loading a preset.");
+    beginUserEdit();
+    applySettings(settings);
+    endUserEdit();
+    return juce::Result::ok();
+}
+
+void KickDuck1AudioProcessor::restoreCompareState(const juce::ValueTree& state)
+{
+    compareSlots = {};
+    compareSlot = juce::jlimit(0, 1, static_cast<int>(state.getProperty("active", 0)));
+    editDepth = 0;
+    editBefore = {};
+    for (int i = 0; i < 2; ++i)
+    {
+        const auto bank = state.getChildWithProperty("slot", i).getChildWithName("Settings");
+        if (bank.isValid()) compareSlots[i].settings = bank.createCopy();
+    }
+    compareSlots[compareSlot].settings = captureSettings();
+}
+
 void KickDuck1AudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
     auto state = apvts.copyState();
-    state.setProperty("stateVersion", 8, nullptr);
+    state.setProperty("stateVersion", 9, nullptr);
     state.setProperty("curveRounded", isCurveRounded(), nullptr);
+    state.setProperty("presetReferenceSeconds", getPresetReferenceSeconds(), nullptr);
     for (auto oldCurve = state.getChildWithName("DuckingCurve"); oldCurve.isValid();
          oldCurve = state.getChildWithName("DuckingCurve"))
         state.removeChild(oldCurve, nullptr);
@@ -577,6 +852,20 @@ void KickDuck1AudioProcessor::getStateInformation(juce::MemoryBlock& destData)
         curveState.addChild(child, -1, nullptr);
     }
     state.addChild(curveState, -1, nullptr);
+    for (auto old = state.getChildWithName("Comparison"); old.isValid(); old = state.getChildWithName("Comparison"))
+        state.removeChild(old, nullptr);
+    juce::ValueTree comparison("Comparison");
+    comparison.setProperty("active", compareSlot, nullptr);
+    auto current = captureSettings();
+    for (int i = 0; i < 2; ++i)
+    {
+        juce::ValueTree bank("Bank");
+        bank.setProperty("slot", i, nullptr);
+        const auto settings = i == compareSlot || !compareSlots[i].settings.isValid() ? current : compareSlots[i].settings;
+        bank.addChild(settings.createCopy(), -1, nullptr);
+        comparison.addChild(bank, -1, nullptr);
+    }
+    state.addChild(comparison, -1, nullptr);
     if (auto xml = state.createXml())
         copyXmlToBinary(*xml, destData);
 }
@@ -589,7 +878,11 @@ void KickDuck1AudioProcessor::setStateInformation(const void* data, int sizeInBy
     if (xml == nullptr || !xml->hasTagName(apvts.state.getType()))
         return;
 
+    std::lock_guard<std::recursive_mutex> lock(editMutex);
+    const juce::ScopedValueSetter<bool> replay(replayingEdit, true);
     auto state = juce::ValueTree::fromXml(*xml);
+    const auto comparison = state.getChildWithName("Comparison");
+    state.removeChild(comparison, nullptr);
     const auto curveState = state.getChildWithName("DuckingCurve");
     std::vector<DuckingCurve::Point> points;
     points.reserve(maxCurvePoints);
@@ -604,6 +897,8 @@ void KickDuck1AudioProcessor::setStateInformation(const void* data, int sizeInBy
     if (points.empty())
         points = DuckingCurve::defaultPoints();
     const int version = static_cast<int>(state.getProperty("stateVersion", 0));
+    const double reference = state.getProperty("presetReferenceSeconds", 0.5);
+    presetReferenceSeconds.store(std::isfinite(reference) && reference > 0 ? reference : 0.5, std::memory_order_relaxed);
     // States before v3 used straight segments. Keep their sound until the user
     // explicitly selects ROUND, a preset or RESET CURVE.
     curveRounded.store(static_cast<bool>(state.getProperty("curveRounded", false)),
@@ -659,6 +954,7 @@ void KickDuck1AudioProcessor::setStateInformation(const void* data, int sizeInBy
             resetCurve();
             setCurveParameter(apvts, "amount", 100.0f);
             curveRounded.store(false, std::memory_order_relaxed);
+            restoreCompareState(comparison);
             return;
         }
         setCurveParameter(apvts, "length", points[1].x * 2.0f);
@@ -687,6 +983,7 @@ void KickDuck1AudioProcessor::setStateInformation(const void* data, int sizeInBy
         if (!points.empty()) points[0].x = 0.0f;
     }
     setCurvePoints(points);
+    restoreCompareState(comparison);
 }
 
 juce::AudioProcessorEditor* KickDuck1AudioProcessor::createEditor()

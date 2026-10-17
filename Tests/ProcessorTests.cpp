@@ -933,11 +933,23 @@ void editorLayoutPreviewsTest()
         require(p->apvts.getRawParameterValue("cycleDivision")->load() == divisionIndex++, "Division button did not update parameter");
     }
     dynamic_cast<juce::TextButton*>(namedChild(*editor, "Division 1/4"))->onClick();
-    for (auto size : {juce::Point<int>{1050, 680}, {1260, 800}, {1800, 1100}, {1050, 1100}, {1800, 680}})
+    for (auto size : {juce::Point<int>{1050, 620}, {1260, 800}, {1800, 1100}, {1050, 1100}, {1800, 680}})
     {
         editor->setSize(size.x, size.y);
         juce::Thread::sleep(100);
         juce::Timer::callPendingTimersSynchronously();
+        std::vector<juce::Rectangle<int>> historyButtons;
+        for (const auto* name : {"A", "B", "A > B", "UNDO", "REDO"})
+        {
+            const auto bounds = namedChild(*editor, name)->getBounds();
+            require(editor->getLocalBounds().contains(bounds) && bounds.getY() > size.y - 64,
+                    "History controls escaped the bottom strip");
+            require(!bounds.intersects(namedChild(*editor, "Signal scope")->getBounds()),
+                    "History controls overlap oscilloscope");
+            for (const auto& previous : historyButtons)
+                require(!bounds.intersects(previous), "History controls overlap each other");
+            historyButtons.push_back(bounds);
+        }
         const auto scope = namedChild(*editor, "Signal scope")->getBounds();
         require(editor->getLocalBounds().contains(scope) && scope.getX() >= 280
                 && scope.getRight() <= size.x - 300 && scope.getBottom() < 70,
@@ -960,7 +972,9 @@ void editorLayoutPreviewsTest()
         }
         std::vector<juce::Rectangle<int>> launchButtons;
         for (auto* child : editor->getChildren())
-            if (child->getName().startsWith("Mode ") || child->getName().startsWith("Division ") || child->getName() == "Bypass")
+            if (child->getName().startsWith("Mode ") || child->getName().startsWith("Division ") || child->getName() == "Bypass" || child->getName() == "A" || child->getName() == "B"
+                || child->getName() == "A > B" || child->getName() == "UNDO" || child->getName() == "REDO"
+                || child->getName() == "Save full preset" || child->getName() == "Load full preset")
             {
                 const auto bounds = child->getBounds();
                 require(editor->getLocalBounds().contains(bounds), "Launch button escaped editor");
@@ -970,12 +984,13 @@ void editorLayoutPreviewsTest()
                 launchButtons.push_back(bounds);
             }
         const auto* firstPreset = namedChild(*editor, "Curve preset: Classic");
+        require(firstPreset->getHeight() == 40, "Curve preset buttons are not compact");
         for (int i = 0; i < DuckingCurve::presetCount; ++i)
         {
             const auto* button = namedChild(*editor, juce::String("Curve preset: ")
                 + DuckingCurve::presetName(static_cast<DuckingCurve::Preset>(i)));
             require(button->getX() < knobs.front().getX(), "Presets are not to the left of the timing controls");
-            require(button->getY() == firstPreset->getY() + (i / 3) * 58,
+            require(button->getY() == firstPreset->getY() + (i / 3) * 46,
                     "Preset tiles are not arranged in two rows of three");
         }
         require(knobs.back().getHeight() > knobs.front().getHeight(), "Main Amount knob is not larger");
@@ -1135,6 +1150,54 @@ void roundedCurvesAndPresetsTest()
     p->resetCurve();
     require(p->isCurveRounded() && p->apvts.getRawParameterValue("amount")->load() == 70.0f,
             "Reset did not restore rounded factory settings");
+}
+
+void startupClassicPresetTest()
+{
+    struct Tempo : juce::AudioPlayHead
+    {
+        double bpm = 120;
+        juce::Optional<PositionInfo> getPosition() const override
+        {
+            PositionInfo info;
+            info.setBpm(bpm);
+            return info;
+        }
+    } tempo;
+    for (double bpm : {90.0, 150.0})
+    {
+        tempo.bpm = bpm;
+        auto p = std::make_unique<KickDuck1AudioProcessor>();
+        prepare(*p);
+        p->setPlayHead(&tempo);
+        process(*p);
+        require(equalCurves(p->getCurvePoints(), DuckingCurve::presetPoints(DuckingCurve::Preset::classic))
+                && p->isCurveRounded() && p->apvts.getRawParameterValue("amount")->load() == 70,
+                "New instance is not initialized with Classic");
+        juce::MemoryBlock before, after;
+        p->getStateInformation(before);
+        auto editor = std::unique_ptr<juce::AudioProcessorEditor>(p->createEditor());
+        auto* classic = dynamic_cast<juce::Button*>(namedChild(*editor, "Curve preset: Classic"));
+        require(editor->getWidth() == 1050 && editor->getHeight() == 620, "Editor did not start at minimum size");
+        require(classic->getToggleState(), "Classic is not highlighted immediately at host tempo");
+        p->getStateInformation(after);
+        require(before == after && !p->canUndoEdit(), "Startup highlight changed saved settings/history");
+        auto* punch = dynamic_cast<juce::Button*>(namedChild(*editor, "Curve preset: Punch"));
+        punch->onClick();
+        require(punch->getToggleState(), "Preset selected at non-default BPM was not highlighted");
+        p->getStateInformation(after);
+        auto restored = std::make_unique<KickDuck1AudioProcessor>();
+        restored->setStateInformation(after.getData(), static_cast<int>(after.getSize()));
+        auto restoredEditor = std::unique_ptr<juce::AudioProcessorEditor>(restored->createEditor());
+        require(dynamic_cast<juce::Button*>(namedChild(*restoredEditor, "Curve preset: Punch"))->getToggleState(),
+                "Saved preset identity was lost on restore");
+        p->undoEdit();
+        editor.reset();
+        editor.reset(p->createEditor());
+        require(dynamic_cast<juce::Button*>(namedChild(*editor, "Curve preset: Classic"))->getToggleState(),
+                "Undo did not restore Classic highlight");
+        p->setPlayHead(nullptr);
+    }
 }
 
 void factoryDefaultAndEndPointTest()
@@ -1592,6 +1655,267 @@ void stereoMeterTests()
     require(p->getInputPeak() > 5.9f, "Above-full-scale peak was hidden by the meter");
 }
 
+void fullPresetTests()
+{
+    auto source = std::make_unique<KickDuck1AudioProcessor>();
+    parameter(*source, "input", -9);
+    parameter(*source, "output", 6);
+    parameter(*source, "amount", 73);
+    parameter(*source, "length", 1.1f);
+    parameter(*source, "attack", 44);
+    parameter(*source, "release", 185);
+    parameter(*source, "mix", 46);
+    parameter(*source, "onsetAttack", 13);
+    parameter(*source, "triggerMode", 2);
+    parameter(*source, "cycleDivision", 3);
+    parameter(*source, "automaticRouting", 0);
+    parameter(*source, "bypass", 1);
+    source->setCurvePoints({{0, 0.1f}, {0.2f, 0.9f}, {0.6f, 0.4f}, {0.95f, 0.1f}, {1, 0}});
+    source->setCurveRounded(false);
+    juce::TemporaryFile saved(".kickduckpreset"), damaged(".kickduckpreset");
+    require(source->savePresetFile(saved.getFile()).wasOk(), "Full preset save failed");
+    auto loaded = std::make_unique<KickDuck1AudioProcessor>();
+    parameter(*loaded, "amount", 20);
+    loaded->selectCompareSlot(1);
+    parameter(*loaded, "amount", 31);
+    const auto previousCurve = loaded->getCurvePoints();
+    require(loaded->loadPresetFile(saved.getFile()).wasOk(), "Full preset load failed");
+    for (int i = 0; i < source->getParameters().size(); ++i)
+        require(std::abs(source->getParameters()[i]->getValue() - loaded->getParameters()[i]->getValue()) < 1.0e-6f,
+                "Full preset lost a parameter");
+    require(equalCurves(source->getCurvePoints(), loaded->getCurvePoints()) && !loaded->isCurveRounded()
+            && loaded->getCompareSlot() == 1, "Full preset lost curve, rounding or selected bank");
+    loaded->undoEdit();
+    require(loaded->apvts.getRawParameterValue("amount")->load() == 31
+            && loaded->apvts.getRawParameterValue("bypass")->load() == 0
+            && equalCurves(loaded->getCurvePoints(), previousCurve) && !loaded->canUndoEdit(),
+            "Preset load did not undo in one step");
+    loaded->selectCompareSlot(0);
+    require(loaded->apvts.getRawParameterValue("amount")->load() == 20, "Preset replaced the inactive bank");
+    loaded->selectCompareSlot(1);
+    loaded->redoEdit();
+    require(equalCurves(source->getCurvePoints(), loaded->getCurvePoints()), "Preset redo failed");
+    require(loaded->savePresetFile(saved.getFile()).wasOk(), "Explicit preset replacement failed");
+    const auto validXml = saved.getFile().loadFileAsString();
+    juce::MemoryBlock before;
+    loaded->getStateInformation(before);
+    const auto unchanged = [&]
+    {
+        juce::MemoryBlock after;
+        loaded->getStateInformation(after);
+        require(after == before, "Rejected preset changed state or comparison bank");
+    };
+    for (const auto* content : {"not xml", "<KickDuck1Preset formatVersion=\"99\"/>", "<OtherPlugin/>"})
+    {
+        require(damaged.getFile().replaceWithText(content), "Could not create test preset");
+        require(loaded->loadPresetFile(damaged.getFile()).failed(), "Malformed preset was accepted");
+        unchanged();
+    }
+    const auto base = juce::ValueTree::fromXml(*juce::XmlDocument::parse(validXml));
+    for (int scenario = 0; scenario < 6; ++scenario)
+    {
+        auto root = base.createCopy();
+        auto settings = root.getChildWithName("Settings");
+        if (scenario == 0) settings.removeChild(settings.getChildWithProperty("id", "amount"), nullptr);
+        if (scenario == 1) settings.getChildWithProperty("id", "amount").setProperty("value", "nan", nullptr);
+        if (scenario == 2) settings.getChildWithProperty("id", "amount").setProperty("value", 101, nullptr);
+        if (scenario == 3) settings.getChildWithName("Curve").getChild(1).setProperty("x", 0, nullptr);
+        if (scenario == 4) settings.getChildWithName("Curve").getChild(0).setProperty("y", "invalid", nullptr);
+        if (scenario == 5) settings.setProperty("rounded", "unknown", nullptr);
+        require(damaged.getFile().replaceWithText(root.createXml()->toString()), "Could not write corrupt preset");
+        require(loaded->loadPresetFile(damaged.getFile()).failed(), "Invalid preset payload was accepted");
+        unchanged();
+    }
+    require(loaded->loadPresetFile(saved.getFile().getSiblingFile("missing-kickduck-preset-file")).failed(),
+            "Missing preset was accepted");
+    require(loaded->savePresetFile(saved.getFile().getChildFile("impossible.kickduckpreset")).failed(),
+            "Preset save to invalid folder did not fail");
+    require(saved.getFile().loadFileAsString() == validXml, "Failed save damaged an existing preset");
+    loaded->beginUserEdit();
+    require(loaded->loadPresetFile(saved.getFile()).failed(), "Preset loaded in the middle of a gesture");
+    loaded->endUserEdit();
+    unchanged();
+    prepare(*source);
+    prepare(*loaded);
+    require(process(*source) == process(*loaded), "Preset restored different audio");
+    parameter(*source, "bypass", 0);
+    parameter(*loaded, "bypass", 0);
+    parameter(*source, "triggerMode", 1);
+    parameter(*loaded, "triggerMode", 1);
+    prepare(*source);
+    prepare(*loaded);
+    for (int i = 0; i < 32; ++i)
+        require(std::abs(process(*source) - process(*loaded)) < 1.0e-6f, "Active preset restored different DSP");
+}
+
+void comparisonAndUndoTests()
+{
+    const auto edit = [](KickDuck1AudioProcessor& p, const char* id, float value)
+    {
+        auto* parameter = p.apvts.getParameter(id);
+        parameter->beginChangeGesture();
+        parameter->setValueNotifyingHost(parameter->convertTo0to1(value));
+        parameter->endChangeGesture();
+    };
+    const auto value = [](KickDuck1AudioProcessor& p, const char* id)
+    {
+        return p.apvts.getRawParameterValue(id)->load();
+    };
+    auto p = std::make_unique<KickDuck1AudioProcessor>();
+    prepare(*p);
+    require(!p->canUndoEdit() && !p->canRedoEdit(), "New processor has undo history");
+    edit(*p, "amount", 40);
+    require(p->canUndoEdit(), "Parameter gesture was not recorded");
+    parameter(*p, "output", 12); // Host-style value update, not an edit gesture.
+    p->undoEdit();
+    require(value(*p, "amount") == 70 && value(*p, "output") == 12,
+            "Undo changed unrelated automated parameter");
+    p->redoEdit();
+    require(value(*p, "amount") == 40, "Parameter redo failed");
+    p->beginUserEdit();
+    for (int i = 0; i < 30; ++i) parameter(*p, "amount", static_cast<float>(i));
+    p->endUserEdit();
+    p->undoEdit();
+    require(value(*p, "amount") == 40, "Drag did not undo as one edit");
+    edit(*p, "amount", 35);
+    require(!p->canRedoEdit(), "New edit did not invalidate redo");
+    const auto originalCurve = p->getCurvePoints();
+    p->beginUserEdit();
+    p->setCurvePoints({{0, 0.25f}, {0.4f, 0.8f}, {1, 0}});
+    p->setCurveRounded(false);
+    p->endUserEdit();
+    p->undoEdit();
+    require(equalCurves(p->getCurvePoints(), originalCurve) && p->isCurveRounded(), "Curve undo failed");
+    p->redoEdit();
+    require(p->getCurvePoints().size() == 3 && !p->isCurveRounded(), "Curve redo failed");
+    p->selectCompareSlot(1);
+    require(p->getCompareSlot() == 1 && value(*p, "amount") == 35 && !p->canUndoEdit(),
+            "First B did not clone A with independent history");
+    edit(*p, "amount", 85);
+    p->beginUserEdit();
+    p->setCurvePoints({{0, 1}, {1, 1}});
+    p->endUserEdit();
+    parameter(*p, "bypass", 1);
+    p->selectCompareSlot(0);
+    require(value(*p, "amount") == 35 && value(*p, "bypass") == 1 && p->getCurvePoints().size() == 3,
+            "A/B lost settings or changed shared Bypass");
+    p->selectCompareSlot(1);
+    require(value(*p, "amount") == 85 && p->getCurvePoints().size() == 2 && p->canUndoEdit(),
+            "B settings/history were not retained");
+    juce::MemoryBlock state;
+    p->getStateInformation(state);
+    auto restored = std::make_unique<KickDuck1AudioProcessor>();
+    restored->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    require(restored->getCompareSlot() == 1 && value(*restored, "amount") == 85 && !restored->canUndoEdit(),
+            "Saved active B or session history reset failed");
+    restored->selectCompareSlot(0);
+    require(value(*restored, "amount") == 35 && restored->getCurvePoints().size() == 3 && !restored->isCurveRounded(),
+            "Saved inactive A was lost");
+    restored->copyCompareSlot();
+    restored->selectCompareSlot(1);
+    require(value(*restored, "amount") == 35 && restored->getCurvePoints().size() == 3, "A to B copy failed");
+    p->undoEdit();
+    require(p->getCurvePoints().size() == 3 && value(*p, "amount") == 85, "Bank-specific undo failed");
+    p->copyCompareSlot();
+    p->selectCompareSlot(0);
+    require(!p->canUndoEdit() && value(*p, "amount") == 85, "Copy did not clear destination history");
+    auto legacy = restored->apvts.copyState();
+    juce::MemoryBlock oldState;
+    juce::AudioProcessor::copyXmlToBinary(*legacy.createXml(), oldState);
+    p->setStateInformation(oldState.getData(), static_cast<int>(oldState.getSize()));
+    require(p->getCompareSlot() == 0 && !p->canUndoEdit() && !p->canRedoEdit(), "Legacy load retained old comparison/history");
+
+    auto editor = std::unique_ptr<juce::AudioProcessorEditor>(p->createEditor());
+    auto* preset = dynamic_cast<juce::Button*>(namedChild(*editor, "Curve preset: Punch"));
+    const auto beforePreset = p->getCurvePoints();
+    const float beforeLength = value(*p, "length");
+    preset->onClick();
+    p->undoEdit();
+    require(equalCurves(p->getCurvePoints(), beforePreset) && value(*p, "length") == beforeLength && !p->canUndoEdit(),
+            "Preset did not undo as one complete operation");
+    p->redoEdit();
+    const auto afterPreset = p->getCurvePoints();
+    const float beforeClose = value(*p, "amount");
+    p->beginUserEdit();
+    parameter(*p, "amount", 19);
+    editor.reset();
+    editor.reset(p->createEditor());
+    require(p->canUndoEdit() && equalCurves(p->getCurvePoints(), afterPreset), "Editor reopen lost history/settings");
+    p->undoEdit();
+    require(value(*p, "amount") == beforeClose, "Closing editor left an unfinished edit");
+    p->redoEdit();
+    auto* amountSlider = dynamic_cast<juce::Slider*>(namedChild(*editor, "AMOUNT"));
+    const float beforeSlider = value(*p, "amount");
+    p->apvts.getParameter("amount")->beginChangeGesture();
+    amountSlider->setValue(17, juce::sendNotificationSync);
+    p->apvts.getParameter("amount")->endChangeGesture();
+    require(p->canUndoEdit(), "Slider gesture was not recorded");
+    p->undoEdit();
+    require(value(*p, "amount") == beforeSlider, "Slider change did not undo");
+    auto concurrent = std::make_unique<KickDuck1AudioProcessor>();
+    prepare(*concurrent);
+    std::atomic<bool> running {true}, ready {false}, valid {true};
+    std::thread audio([&]
+    {
+        juce::AudioBuffer<float> buffer(4, 64);
+        juce::MidiBuffer midi;
+        ready.store(true);
+        do
+        {
+            for (int i = 0; i < 64; ++i)
+            {
+                buffer.setSample(0, i, 0.5f);
+                buffer.setSample(1, i, -0.5f);
+                buffer.setSample(2, i, i == 0 ? 1.0f : 0.0f);
+                buffer.setSample(3, i, 0);
+            }
+#if KICKDUCK_ALLOCATION_PROBE
+            AllocationProbe::begin();
+#endif
+            concurrent->processBlock(buffer, midi);
+#if KICKDUCK_ALLOCATION_PROBE
+            const auto count = AllocationProbe::end();
+            if (count.cpp != 0 || count.heap != 0) valid.store(false);
+#endif
+            for (int i = 0; i < 64; ++i)
+                if (!std::isfinite(buffer.getSample(0, i)) || buffer.getSample(0, i) < 0 || buffer.getSample(0, i) > 0.50001f)
+                    valid.store(false);
+        } while (running.load());
+    });
+    while (!ready.load()) std::this_thread::yield();
+    for (int i = 0; i < 100; ++i)
+    {
+        concurrent->beginUserEdit();
+        edit(*concurrent, "amount", static_cast<float>(i));
+        concurrent->setCurvePoints({{0, 1}, {0.5f, 0.3f}, {1, 0}});
+        concurrent->endUserEdit();
+        concurrent->selectCompareSlot(i % 2);
+        concurrent->undoEdit();
+        concurrent->redoEdit();
+    }
+    running.store(false);
+    audio.join();
+    require(valid.load(), "Concurrent A/B/Undo edits produced invalid audio or allocated in DSP");
+    auto bounded = std::make_unique<KickDuck1AudioProcessor>();
+    for (int i = 0; i <= 70; ++i) edit(*bounded, "amount", static_cast<float>(i));
+    int steps = 0;
+    while (bounded->canUndoEdit()) { bounded->undoEdit(); ++steps; }
+    require(steps == 64 && value(*bounded, "amount") == 6, "Undo history is not bounded to 64 edits");
+    std::thread audioGesture([&]
+    {
+#if KICKDUCK_ALLOCATION_PROBE
+        AllocationProbe::begin();
+#endif
+        edit(*bounded, "amount", 20);
+#if KICKDUCK_ALLOCATION_PROBE
+        const auto count = AllocationProbe::end();
+        require(count.cpp == 0 && count.heap == 0, "Non-GUI parameter gesture allocated history");
+#endif
+    });
+    audioGesture.join();
+    require(!bounded->canUndoEdit(), "Audio-thread gesture entered GUI undo history");
+}
+
 void concurrentPublicationTest()
 {
     auto p = std::make_unique<KickDuck1AudioProcessor>();
@@ -1646,6 +1970,7 @@ int main()
         triggeredFrameTests();
         editorLayoutPreviewsTest();
         roundedCurvesAndPresetsTest();
+        startupClassicPresetTest();
         factoryDefaultAndEndPointTest();
         onsetAttackAndBassOnlyTests();
         bpmOfflineAndTimingLimitsTests();
@@ -1653,6 +1978,8 @@ int main()
         longerScopeHistoryTests();
         liveCompressionHistoryTests();
         stereoMeterTests();
+        fullPresetTests();
+        comparisonAndUndoTests();
         concurrentPublicationTest();
         std::cout << "PASS: state, migration, normalization, headless DSP, Mix, Length, editor lifecycle, all five depths/time handles, knob round trips, detector tails/oscillation/weak hits, parameter and curve smoothing, block invariance, concurrent curve publication\n";
         return 0;

@@ -62,6 +62,7 @@ private:
         void setRounded(bool value) { rounded = value; }
 
         std::function<void(const std::vector<DuckingCurve::Point>&)> onPointsChanged;
+        std::function<void()> onEditStarted, onEditFinished;
 
         void paint(juce::Graphics&) override;
         void mouseMove(const juce::MouseEvent&) override;
@@ -107,6 +108,7 @@ private:
     void timerCallback() override;
     void updateWaveform();
     void updateMeters();
+    void choosePresetFile(bool save);
     void setupKnob(juce::Slider&, juce::Label&, const juce::String&);
     static juce::Font font(float size, bool bold = false);
     static juce::String formatDb(float);
@@ -129,6 +131,11 @@ private:
     std::array<CompactButton, 3> modeButtons;
     std::array<CompactButton, 5> divisionButtons;
     CompactButton bypassButton {"BYPASS"};
+    CompactButton compareAButton {"A"}, compareBButton {"B"}, copyCompareButton {"A > B"};
+    CompactButton undoButton {"UNDO"}, redoButton {"REDO"};
+    CompactButton savePresetButton {"SAVE"}, loadPresetButton {"LOAD"};
+    std::unique_ptr<juce::FileChooser> presetChooser;
+    bool presetDialogOpen = false;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAttachment;
     std::array<std::unique_ptr<CurvePresetButton>, DuckingCurve::presetCount> presetButtons;
     juce::TooltipWindow tooltipWindow {this, 500};
@@ -158,6 +165,7 @@ private:
     struct Layout
     {
         juce::Rectangle<int> graph, meters, presets, shape, gains, amount;
+        juce::Rectangle<int> modes, divisions, compare, history, files, bypass;
     } layout;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(KickDuck1AudioProcessorEditor)
